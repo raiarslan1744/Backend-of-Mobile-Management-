@@ -2,10 +2,12 @@ FROM dart:stable
 
 WORKDIR /app
 
-COPY pubspec.yaml pubspec.lock ./
-RUN dart pub get
+COPY backend/pubspec.yaml backend/pubspec.lock ./backend/
+RUN cd /app/backend && dart pub get
 
-COPY . .
+COPY backend ./backend
+
+WORKDIR /app/backend
 
 EXPOSE 8080
 
