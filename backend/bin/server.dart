@@ -509,23 +509,39 @@ class ServerApp {
       'SELECT * FROM users WHERE username = ? AND shop_id = ? AND password_hash = ? AND role = ?',
       [username, suppliedShopId, hashPassword(password), 'admin'],
     );
+    final shopCredentialRows = shopAdminRows.isEmpty
+        ? await db.select(
+            'SELECT * FROM shops WHERE username = ? AND shop_id = ? AND password_hash = ?',
+            [username, suppliedShopId, hashPassword(password)],
+          )
+        : const <Map<String, Object?>>[];
     final employeeRows = await db.select(
       'SELECT * FROM employees WHERE username = ? AND shop_id = ? AND password_hash = ?',
       [username, suppliedShopId, hashPassword(password)],
     );
-    if (superAdminRows.isEmpty && shopAdminRows.isEmpty && employeeRows.isEmpty) {
+    if (superAdminRows.isEmpty && shopAdminRows.isEmpty && shopCredentialRows.isEmpty && employeeRows.isEmpty) {
       return shelf.Response(401, body: jsonEncode({'error': 'Invalid credentials', 'code': 'INVALID_CREDENTIALS'}));
     }
 
     final user = superAdminRows.isNotEmpty
         ? superAdminRows.first
-        : (shopAdminRows.isNotEmpty ? shopAdminRows.first : {
+        : (shopAdminRows.isNotEmpty
+            ? shopAdminRows.first
+            : (shopCredentialRows.isNotEmpty
+                ? {
+                    'id': 'shop:${shopCredentialRows.first['shop_id']}',
+                    'username': shopCredentialRows.first['username'],
+                    'shop_id': shopCredentialRows.first['shop_id'],
+                    'role': 'admin',
+                    'password_hash': shopCredentialRows.first['password_hash'],
+                  }
+                : {
             'id': employeeRows.first['id'],
             'username': employeeRows.first['username'],
             'shop_id': employeeRows.first['shop_id'],
             'role': 'employee',
             'password_hash': employeeRows.first['password_hash'],
-          });
+          }));
     final shopId = user['shop_id']?.toString() ?? (superAdminRows.isNotEmpty ? 'SUPER_ADMIN' : suppliedShopId);
     final role = user['role']?.toString() ?? 'employee';
     if (role != 'super_admin' && suppliedShopId.isNotEmpty && suppliedShopId != shopId) {
