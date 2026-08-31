@@ -6,7 +6,6 @@ import 'package:postgres/postgres.dart';
 import 'package:shelf/shelf.dart' as shelf;
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart';
-import 'package:sqlite3/sqlite3.dart';
 import 'package:uuid/uuid.dart';
 
 String hashPassword(String password) {
@@ -24,60 +23,43 @@ String? authTokenFromRequest(shelf.Request request) {
 }
 
 class DatabaseAdapter {
-  DatabaseAdapter._({this.sqliteDatabase, this.postgresConnection});
+  DatabaseAdapter._({required this.postgresConnection});
 
-  final Database? sqliteDatabase;
   final Connection? postgresConnection;
 
   static Future<DatabaseAdapter> open() async {
     final databaseUrl = Platform.environment['DATABASE_URL'];
-    if (databaseUrl != null && databaseUrl.trim().isNotEmpty) {
-      try {
-        final connection = await Connection.openFromUrl(databaseUrl);
-        return DatabaseAdapter._(postgresConnection: connection);
-      } catch (_) {
-        // The configured URL is invalid or network-restricted. Fall back to the
-        // local SQLite database to preserve local development behavior.
-      }
+    if (databaseUrl == null || databaseUrl.trim().isEmpty) {
+      throw StateError('DATABASE_URL is required for the production backend.');
     }
 
-    final dbPath = Platform.environment['AK_DB_PATH'] ?? 'data/ak_mobile_shop_cloud.sqlite';
-    final file = File(dbPath);
-    await file.parent.create(recursive: true);
-    return DatabaseAdapter._(sqliteDatabase: sqlite3.open(dbPath));
+    final connection = await Connection.openFromUrl(databaseUrl);
+    return DatabaseAdapter._(postgresConnection: connection);
   }
 
   Future<List<Map<String, Object?>>> select(String sql, [List<Object?> parameters = const []]) async {
-    if (postgresConnection != null) {
-      final normalized = _normalizeSql(sql, parameters);
-      final result = await postgresConnection!.execute(
-        normalized.sql,
-        parameters: normalized.values,
-      );
-      return result.map((row) => Map<String, Object?>.from(row.toColumnMap())).toList(growable: false);
-    }
-    return sqliteDatabase!.select(sql, parameters);
+    final normalized = _normalizeSql(sql, parameters);
+    final result = await postgresConnection!.execute(
+      normalized.sql,
+      parameters: normalized.values,
+    );
+    return result.map((row) => Map<String, Object?>.from(row.toColumnMap())).toList(growable: false);
   }
 
   Future<void> execute(String sql, [List<Object?> parameters = const []]) async {
-    if (postgresConnection != null) {
-      final normalized = _normalizeSql(sql, parameters);
-      await postgresConnection!.execute(
-        normalized.sql,
-        parameters: normalized.values,
-      );
-      return;
-    }
-    sqliteDatabase!.execute(sql, parameters);
+    final normalized = _normalizeSql(sql, parameters);
+    await postgresConnection!.execute(
+      normalized.sql,
+      parameters: normalized.values,
+    );
   }
 
   Future<void> dispose() async {
-    sqliteDatabase?.dispose();
     await postgresConnection?.close();
   }
 
   ({String sql, List<Object?> values}) _normalizeSql(String sql, List<Object?> parameters) {
-    var normalized = _postgresify(sql);
+    var normalized = sql.trim();
     final values = <Object?>[];
     if (parameters.isNotEmpty) {
       var index = 0;
@@ -89,68 +71,19 @@ class DatabaseAdapter {
     }
     return (sql: normalized, values: values);
   }
-
-  String _postgresify(String sql) {
-    var normalized = sql.trim();
-    normalized = normalized.replaceAll(RegExp(r'\bAUTOINCREMENT\b', caseSensitive: false), '');
-    normalized = normalized.replaceAll(RegExp(r'\bINTEGER PRIMARY KEY\b', caseSensitive: false), 'BIGSERIAL PRIMARY KEY');
-    normalized = normalized.replaceAll(RegExp(r'\bCURRENT_TIMESTAMP\b', caseSensitive: false), 'NOW()');
-    normalized = _rewriteInsertOrReplace(normalized);
-    normalized = _rewriteInsertOrIgnore(normalized);
-    if (normalized.toUpperCase().contains('PRAGMA ')) {
-      return normalized;
-    }
-    return normalized;
-  }
-
-  String _rewriteInsertOrReplace(String sql) {
-    final match = RegExp(
-      r'INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\((.*)\)',
-      caseSensitive: false,
-    ).firstMatch(sql);
-    if (match == null) {
-      return sql;
-    }
-
-    final table = match.group(1)!;
-    final columns = match.group(2)!.split(',').map((column) => column.trim()).where((column) => column.isNotEmpty).toList();
-    final values = match.group(3)!;
-    final assignments = columns
-        .where((column) => column.toLowerCase() != 'id')
-        .map((column) => '"$column" = EXCLUDED."$column"')
-        .join(', ');
-    return 'INSERT INTO "$table" (${columns.map((column) => '"$column"').join(', ')}) VALUES ($values) ON CONFLICT ("id") DO UPDATE SET $assignments';
-  }
-
-  String _rewriteInsertOrIgnore(String sql) {
-    final match = RegExp(
-      r'INSERT\s+OR\s+IGNORE\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\((.*)\)',
-      caseSensitive: false,
-    ).firstMatch(sql);
-    if (match == null) {
-      return sql;
-    }
-
-    final table = match.group(1)!;
-    final columns = match.group(2)!.split(',').map((column) => column.trim()).where((column) => column.isNotEmpty).toList();
-    final values = match.group(3)!;
-    return 'INSERT INTO "$table" (${columns.map((column) => '"$column"').join(', ')}) VALUES ($values) ON CONFLICT DO NOTHING';
-  }
 }
 
 class ServerApp {
-  ServerApp._(this.dbPath, this.db);
+  ServerApp._(this.db);
 
   static ServerApp? _activeInstance;
 
-  final String dbPath;
   final DatabaseAdapter db;
   final Router router = Router();
   HttpServer? _httpServer;
   int? _port;
 
   static Future<ServerApp> start({String? dbPath, int? port}) async {
-    final resolvedDbPath = dbPath ?? Platform.environment['AK_DB_PATH'] ?? 'data/ak_mobile_shop_cloud.sqlite';
     final resolvedPort = port ?? int.tryParse(Platform.environment['PORT'] ?? '') ?? 8080;
 
     if (_activeInstance != null) {
@@ -161,7 +94,7 @@ class ServerApp {
     }
 
     final database = await DatabaseAdapter.open();
-    final app = ServerApp._(resolvedDbPath, database);
+    final app = ServerApp._(database);
     await app._initializeSchema();
     app._registerRoutes();
     _activeInstance = app;
@@ -205,7 +138,7 @@ class ServerApp {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )
-    ''' );
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS super_admin (
@@ -215,7 +148,7 @@ class ServerApp {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )
-    ''' );
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS users (
@@ -228,9 +161,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         UNIQUE(shop_id, username)
       )
-    ''' );
-
-    await _seedSuperAdmin();
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS sessions (
@@ -241,7 +172,7 @@ class ServerApp {
         expires_at TEXT NOT NULL,
         created_at TEXT NOT NULL
       )
-    ''' );
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS devices (
@@ -256,7 +187,7 @@ class ServerApp {
         last_seen_at TEXT NOT NULL,
         UNIQUE(shop_id, device_id)
       )
-    ''' );
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS sync_records (
@@ -270,7 +201,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''' );
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS products (
@@ -283,7 +214,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''' );
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS sales (
@@ -303,7 +234,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''' );
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS customers (
@@ -316,7 +247,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''' );
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS employees (
@@ -330,7 +261,7 @@ class ServerApp {
         is_deleted INTEGER NOT NULL DEFAULT 0,
         UNIQUE(shop_id, username)
       )
-    ''' );
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS repairs (
@@ -344,7 +275,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''' );
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS debtors (
@@ -357,7 +288,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''' );
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS debt_transactions (
@@ -371,10 +302,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''' );
-    try {
-      await db.execute('ALTER TABLE debt_transactions ADD COLUMN shop_id TEXT NOT NULL DEFAULT ""');
-    } catch (_) {}
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS accessories (
@@ -388,7 +316,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''' );
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS mobile_devices (
@@ -405,7 +333,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''' );
+    ''');
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS purchases (
@@ -418,7 +346,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''' );
+    ''');
 
     await db.execute('CREATE INDEX IF NOT EXISTS idx_sync_records_shop_updated ON sync_records(shop_id, updated_at)');
     await db.execute('CREATE INDEX IF NOT EXISTS idx_records_entity_type ON sync_records(entity_type, entity_id)');
@@ -426,27 +354,43 @@ class ServerApp {
     await db.execute('CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token)');
 
     await _ensureTableColumns();
+    await _seedSuperAdmin();
   }
 
   Future<void> _ensureTableColumns() async {
-    await _ensureColumn('debt_transactions', 'shop_id', 'TEXT NOT NULL DEFAULT ""');
+    await _ensureColumn('debt_transactions', 'shop_id', 'TEXT NOT NULL DEFAULT \"\"');
   }
 
   Future<bool> _tableExists(String tableName) async {
-    final rows = await db.select('SELECT name FROM sqlite_master WHERE type = ? AND name = ?', ['table', tableName]);
-    return rows.isNotEmpty;
+    final rows = await db.select(
+      'SELECT EXISTS ( SELECT 1 FROM information_schema.tables WHERE table_schema = \$1 AND table_name = \$2 ) AS table_exists',
+      ['public', tableName],
+    );
+    return rows.isNotEmpty && (rows.first['table_exists'] == true);
   }
 
   Future<void> _ensureColumn(String tableName, String columnName, String columnDefinition) async {
     if (!await _tableExists(tableName)) return;
-    final columns = await db.select('PRAGMA table_info($tableName)');
-    final exists = columns.any((column) => column['name'] == columnName);
-    if (!exists) {
-      await db.execute('ALTER TABLE $tableName ADD COLUMN $columnName $columnDefinition');
+
+    final rows = await db.select(
+      'SELECT EXISTS ( SELECT 1 FROM information_schema.columns WHERE table_schema = \$1 AND table_name = \$2 AND column_name = \$3 ) AS column_exists',
+      ['public', tableName, columnName],
+    );
+    if (rows.isNotEmpty && (rows.first['column_exists'] == true)) {
+      return;
     }
+
+    final quotedTable = _quoteIdentifier(tableName);
+    final quotedColumn = _quoteIdentifier(columnName);
+    await db.execute('ALTER TABLE $quotedTable ADD COLUMN IF NOT EXISTS $quotedColumn $columnDefinition');
+  }
+
+  String _quoteIdentifier(String identifier) {
+    return '"${identifier.replaceAll('"', '""')}"';
   }
 
   void _registerRoutes() {
+    router.get('/health', _health);
     router.get('/api/health', _health);
     router.get('/api/super-admin/shops', _listShops);
     router.post('/api/super-admin/shops', _createShop);
@@ -471,12 +415,12 @@ class ServerApp {
     final username = Platform.environment['SUPER_ADMIN_USERNAME'] ?? 'admin';
     final passwordHash = hashPassword(Platform.environment['SUPER_ADMIN_PASSWORD'] ?? 'admin123');
     await db.execute(
-      'INSERT INTO super_admin (id, username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO super_admin (id, username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING',
       [1, username, passwordHash, now, now],
     );
     final userId = const Uuid().v4();
     await db.execute(
-      'INSERT OR IGNORE INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, username) DO NOTHING',
       [userId, username, passwordHash, 'SUPER_ADMIN', 'super_admin', now, now],
     );
   }
@@ -516,7 +460,7 @@ class ServerApp {
 
     final userId = const Uuid().v4();
     await db.execute(
-      'INSERT OR IGNORE INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, username) DO NOTHING',
       [userId, username, hashPassword(password), shopId, 'admin', now, now],
     );
 
@@ -600,7 +544,7 @@ class ServerApp {
     };
 
     await db.execute(
-      'INSERT OR REPLACE INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, device_id) DO UPDATE SET user_id = EXCLUDED.user_id, imei = EXCLUDED.imei, device_name = EXCLUDED.device_name, device_type = EXCLUDED.device_type, last_seen_at = EXCLUDED.last_seen_at',
       [const Uuid().v4(), user['id'] as String, shopId, deviceId, deviceId, 'Flutter Client', 'windows', now, now],
     );
 
@@ -641,7 +585,7 @@ class ServerApp {
     final userId = auth['user']['id'] as String;
     final now = utcNow();
     await db.execute(
-      'INSERT OR REPLACE INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, device_id) DO UPDATE SET user_id = EXCLUDED.user_id, imei = EXCLUDED.imei, device_name = EXCLUDED.device_name, device_type = EXCLUDED.device_type, last_seen_at = EXCLUDED.last_seen_at',
       [const Uuid().v4(), userId, shopId, deviceId, body['imei']?.toString() ?? deviceId, body['deviceName']?.toString() ?? 'Flutter Client', body['deviceType']?.toString() ?? 'windows', now, now],
     );
     return shelf.Response.ok(jsonEncode({'registered': true, 'deviceId': deviceId}));
@@ -677,7 +621,7 @@ class ServerApp {
       final recordId = map['id']?.toString() ?? const Uuid().v4();
       final recordTs = (map['createdAt'] ?? now).toString();
 
-      await db.execute('INSERT OR REPLACE INTO sync_records (id, shop_id, entity_type, entity_id, operation, data, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [
+      await db.execute('INSERT INTO sync_records (id, shop_id, entity_type, entity_id, operation, data, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET shop_id = EXCLUDED.shop_id, entity_type = EXCLUDED.entity_type, entity_id = EXCLUDED.entity_id, operation = EXCLUDED.operation, data = EXCLUDED.data, updated_at = EXCLUDED.updated_at, is_deleted = EXCLUDED.is_deleted', [
         recordId,
         shopId,
         entityType,
@@ -778,7 +722,7 @@ class ServerApp {
     final shopId = auth['user']['shop_id'] as String;
     final now = utcNow();
     await db.execute(
-      'INSERT OR REPLACE INTO sync_records (id, shop_id, entity_type, entity_id, operation, data, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO sync_records (id, shop_id, entity_type, entity_id, operation, data, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET shop_id = EXCLUDED.shop_id, entity_type = EXCLUDED.entity_type, entity_id = EXCLUDED.entity_id, operation = EXCLUDED.operation, data = EXCLUDED.data, updated_at = EXCLUDED.updated_at, is_deleted = EXCLUDED.is_deleted',
       [const Uuid().v4(), shopId, 'conflict', '$entityType:$entityId', 'conflict', jsonEncode(conflict), now, now, 0],
     );
     return shelf.Response.ok(jsonEncode({'resolved': true, 'entityType': entityType, 'entityId': entityId}));
@@ -805,11 +749,11 @@ class ServerApp {
     final now = utcNow();
     final passwordHash = hashPassword(password);
     await db.execute(
-      'INSERT OR REPLACE INTO employees (id, shop_id, username, password_hash, status, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO employees (id, shop_id, username, password_hash, status, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET shop_id = EXCLUDED.shop_id, username = EXCLUDED.username, password_hash = EXCLUDED.password_hash, status = EXCLUDED.status, updated_at = EXCLUDED.updated_at, is_deleted = EXCLUDED.is_deleted',
       [employeeId, shopId, username, passwordHash, body['status']?.toString() ?? 'active', now, now, 0],
     );
     await db.execute(
-      'INSERT OR REPLACE INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, username) DO UPDATE SET password_hash = EXCLUDED.password_hash, updated_at = EXCLUDED.updated_at, role = EXCLUDED.role',
       [employeeId, username, passwordHash, shopId, 'employee', now, now],
     );
 
@@ -931,7 +875,8 @@ class ServerApp {
 
   Future<void> _upsertEntity(String tableName, Map<String, dynamic> row, String operation) async {
     final columns = row.keys.toList();
-    final createClause = 'INSERT INTO $tableName (${columns.join(', ')}) VALUES (${List.filled(columns.length, '?').join(', ')}) ON CONFLICT(id) DO UPDATE SET ${columns.map((column) => '$column = excluded.$column').join(', ')}';
+    final quotedColumns = columns.map((column) => '"$column"').join(', ');
+    final createClause = 'INSERT INTO "$tableName" ($quotedColumns) VALUES (${List.filled(columns.length, '?').join(', ')}) ON CONFLICT (id) DO UPDATE SET ${columns.map((column) => '"$column" = EXCLUDED."$column"').join(', ')}';
     final values = columns.map((column) => row[column]).toList();
 
     if (operation == 'delete') {
@@ -948,8 +893,7 @@ class ServerApp {
 
 Future<void> main() async {
   final port = int.tryParse(Platform.environment['PORT'] ?? '') ?? 8080;
-  final dbPath = Platform.environment['AK_DB_PATH'] ?? 'data/ak_mobile_shop_cloud.sqlite';
-  final app = await ServerApp.start(dbPath: dbPath, port: port);
+  final app = await ServerApp.start(port: port);
   await app.listen(host: InternetAddress.anyIPv4, port: port);
   final server = app._httpServer!;
   stderr.writeln('AK Mobile Shop backend listening on ${server.address.host}:${server.port}');

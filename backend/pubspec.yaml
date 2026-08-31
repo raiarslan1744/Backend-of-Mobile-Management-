@@ -12,7 +12,6 @@ dependencies:
   postgres: ^3.0.0
   shelf: ^1.4.0
   shelf_router: ^1.1.4
-  sqlite3: ^2.9.4
   uuid: ^4.0.0
 
 dev_dependencies:

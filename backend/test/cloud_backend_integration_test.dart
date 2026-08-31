@@ -1,19 +1,28 @@
 import 'dart:convert';
+import 'dart:io';
+
 import 'package:http/http.dart' as http;
 import 'package:test/test.dart';
 
 import '../bin/server.dart';
 
 void main() {
+  final hasDatabase = (Platform.environment['TEST_DATABASE_URL'] ?? Platform.environment['DATABASE_URL']) != null &&
+      (Platform.environment['TEST_DATABASE_URL'] ?? Platform.environment['DATABASE_URL'] ?? '').trim().isNotEmpty;
+
+  if (!hasDatabase) {
+    test('PostgreSQL integration tests are skipped when TEST_DATABASE_URL is not configured.', () {
+      expect(true, isTrue);
+    });
+    return;
+  }
+
   const port = 8080;
   late ServerApp server;
 
   setUp(() async {
     await ServerApp.stopAll();
-    server = await ServerApp.start(
-      dbPath: 'data/test_${DateTime.now().microsecondsSinceEpoch}.sqlite',
-      port: port,
-    );
+    server = await ServerApp.start(port: port);
     await server.listen(port: port);
     await Future<void>.delayed(const Duration(milliseconds: 200));
   });
