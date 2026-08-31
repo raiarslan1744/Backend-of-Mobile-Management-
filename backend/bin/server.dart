@@ -21,6 +21,13 @@ class SuperAdminCredentials {
   final String password;
 }
 
+class SuperAdminUserSeedResult {
+  const SuperAdminUserSeedResult({required this.shouldInsert, required this.existingUserId});
+
+  final bool shouldInsert;
+  final String? existingUserId;
+}
+
 SuperAdminCredentials resolveSuperAdminCredentials(Map<String, String> environment) {
   final username = environment['SUPER_ADMIN_USERNAME']?.trim() ?? '';
   final password = environment['SUPER_ADMIN_PASSWORD']?.trim() ?? '';
@@ -28,6 +35,17 @@ SuperAdminCredentials resolveSuperAdminCredentials(Map<String, String> environme
     throw StateError('SUPER_ADMIN_USERNAME and SUPER_ADMIN_PASSWORD must be configured in the environment.');
   }
   return SuperAdminCredentials(username: username, password: password);
+}
+
+SuperAdminUserSeedResult resolveSuperAdminUserAction(List<Map<String, Object?>> existingUsers) {
+  for (final row in existingUsers) {
+    final role = row['role']?.toString() ?? '';
+    final shopId = row['shop_id']?.toString() ?? '';
+    if (role == 'super_admin' || shopId == 'SUPER_ADMIN') {
+      return SuperAdminUserSeedResult(shouldInsert: false, existingUserId: row['id']?.toString());
+    }
+  }
+  return const SuperAdminUserSeedResult(shouldInsert: true, existingUserId: null);
 }
 
 List<String> getShopCleanupTableOrder() => const [
@@ -454,7 +472,7 @@ class ServerApp {
     final now = utcNow();
     final passwordHash = hashPassword(config.password);
 
-    final existingSuperAdmin = await db.select('SELECT id, username, password_hash FROM super_admin WHERE id = 1');
+    final existingSuperAdmin = await db.select('SELECT id, username, password_hash FROM super_admin WHERE id = 1 LIMIT 1');
     if (existingSuperAdmin.isEmpty) {
       await db.execute(
         'INSERT INTO super_admin (id, username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, password_hash = EXCLUDED.password_hash, updated_at = EXCLUDED.updated_at',
@@ -467,14 +485,24 @@ class ServerApp {
       );
     }
 
-    final existingSuperAdminUser = await db.select(
-      'SELECT id FROM users WHERE shop_id = ? AND role = ?',
-      ['SUPER_ADMIN', 'super_admin'],
+    final existingSuperAdminUsers = await db.select(
+      'SELECT id, role, shop_id FROM users WHERE role = ? OR shop_id = ? ORDER BY created_at DESC LIMIT 1',
+      ['super_admin', 'SUPER_ADMIN'],
     );
-    final userId = existingSuperAdminUser.isNotEmpty ? existingSuperAdminUser.first['id'] as String : const Uuid().v4();
+    final userAction = resolveSuperAdminUserAction(existingSuperAdminUsers);
+    final stableUserId = userAction.existingUserId ?? 'SUPER_ADMIN';
+
+    if (userAction.shouldInsert) {
+      await db.execute(
+        'INSERT INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, password_hash = EXCLUDED.password_hash, shop_id = EXCLUDED.shop_id, role = EXCLUDED.role, updated_at = EXCLUDED.updated_at',
+        [stableUserId, config.username, passwordHash, 'SUPER_ADMIN', 'super_admin', now, now],
+      );
+      return;
+    }
+
     await db.execute(
-      'INSERT INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, username) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = EXCLUDED.role, updated_at = EXCLUDED.updated_at',
-      [userId, config.username, passwordHash, 'SUPER_ADMIN', 'super_admin', now, now],
+      'UPDATE users SET username = ?, password_hash = ?, shop_id = ?, role = ?, updated_at = ? WHERE id = ?',
+      [config.username, passwordHash, 'SUPER_ADMIN', 'super_admin', now, stableUserId],
     );
   }
 
