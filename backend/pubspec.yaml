@@ -1,0 +1,20 @@
+name: ak_mobile_shop_backend
+description: Real backend for AK Mobile Shop cloud sync.
+version: 1.0.0
+publish_to: 'none'
+
+environment:
+  sdk: ^3.13.1
+
+dependencies:
+  crypto: ^3.0.6
+  http: ^1.2.2
+  postgres: ^3.0.0
+  shelf: ^1.4.0
+  shelf_router: ^1.1.4
+  sqlite3: ^2.9.4
+  uuid: ^4.0.0
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0

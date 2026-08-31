@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: ak-mobile-shop-backend
+    plan: free
+    runtime: dart
+    buildCommand: "dart pub get"
+    startCommand: "dart run bin/server.dart"
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: DATABASE_URL
+        value: "postgresql://USER:PASSWORD@HOST:PORT/DATABASE"
+      - key: SUPER_ADMIN_USERNAME
+        value: "CHANGE_ME"
+      - key: SUPER_ADMIN_PASSWORD
+        value: "CHANGE_ME"

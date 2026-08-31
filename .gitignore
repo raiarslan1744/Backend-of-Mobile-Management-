@@ -1,0 +1,11 @@
+.env
+.env.*
+*.sqlite
+*.sqlite3
+*.db
+.dart_tool/
+build/
+coverage/
+.idea/
+.vscode/
+'DON'T' 
