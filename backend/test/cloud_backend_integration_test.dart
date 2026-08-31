@@ -219,5 +219,80 @@ void main() {
       );
       expect(crossShopAccess.statusCode, 403);
     });
+
+    test('super admin can permanently delete a shop and a reused shop ID starts clean', () async {
+      final originalShopId = 'SHOP-${DateTime.now().microsecondsSinceEpoch}';
+      final superUsername = Platform.environment['SUPER_ADMIN_USERNAME'] ?? 'admin';
+      final superPassword = Platform.environment['SUPER_ADMIN_PASSWORD'] ?? 'admin123';
+
+      final createShopResponse = await http.post(
+        Uri.parse('http://127.0.0.1:8080/api/shops'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'shopId': originalShopId,
+          'ownerName': 'Delete Test',
+          'contact': '12345',
+          'address': 'Deleted Street',
+          'username': 'delete-admin',
+          'password': 'delete-pass',
+        }),
+      );
+      expect(createShopResponse.statusCode, 200, reason: createShopResponse.body);
+
+      final superLogin = await http.post(
+        Uri.parse('http://127.0.0.1:8080/api/auth/login'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'username': superUsername,
+          'password': superPassword,
+          'shopId': 'SUPER_ADMIN',
+          'deviceId': 'super-admin-delete-test',
+        }),
+      );
+      expect(superLogin.statusCode, 200, reason: superLogin.body);
+
+      final superSession = jsonDecode(superLogin.body) as Map<String, dynamic>;
+      final superToken = superSession['authToken'] as String;
+
+      final deleteResponse = await http.delete(
+        Uri.parse('http://127.0.0.1:8080/api/super-admin/shops/$originalShopId'),
+        headers: {'Authorization': 'Bearer $superToken'},
+      );
+      expect(deleteResponse.statusCode, 200, reason: deleteResponse.body);
+
+      final listResponse = await http.get(
+        Uri.parse('http://127.0.0.1:8080/api/super-admin/shops'),
+        headers: {'Authorization': 'Bearer $superToken'},
+      );
+      expect(listResponse.statusCode, 200, reason: listResponse.body);
+      final shops = jsonDecode(listResponse.body) as List<dynamic>;
+      expect(shops.any((shop) => (shop as Map<String, dynamic>)['shopId'] == originalShopId), isFalse);
+
+      final recreateShopResponse = await http.post(
+        Uri.parse('http://127.0.0.1:8080/api/shops'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'shopId': originalShopId,
+          'ownerName': 'Fresh Shop Owner',
+          'contact': '99999',
+          'address': 'New Street',
+          'username': 'fresh-admin',
+          'password': 'fresh-pass',
+        }),
+      );
+      expect(recreateShopResponse.statusCode, 200, reason: recreateShopResponse.body);
+
+      final loginAfterReuse = await http.post(
+        Uri.parse('http://127.0.0.1:8080/api/auth/login'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'username': 'fresh-admin',
+          'password': 'fresh-pass',
+          'shopId': originalShopId,
+          'deviceId': 'reuse-device',
+        }),
+      );
+      expect(loginAfterReuse.statusCode, 200, reason: loginAfterReuse.body);
+    });
   });
 }
