@@ -59,16 +59,23 @@ class DatabaseAdapter {
   }
 
   ({String sql, List<Object?> values}) _normalizeSql(String sql, List<Object?> parameters) {
-    var normalized = sql.trim();
-    final values = <Object?>[];
-    if (parameters.isNotEmpty) {
-      var index = 0;
-      normalized = normalized.replaceAllMapped(RegExp(r'\?'), (match) {
-        index++;
-        values.add(parameters[index - 1]);
-        return '\$${index}';
-      });
+    final trimmed = sql.trim();
+    if (parameters.isEmpty) {
+      return (sql: trimmed, values: const []);
     }
+
+    if (RegExp(r'\$\d+').hasMatch(trimmed)) {
+      return (sql: trimmed, values: parameters);
+    }
+
+    var normalized = trimmed;
+    final values = <Object?>[];
+    var index = 0;
+    normalized = normalized.replaceAllMapped(RegExp(r'\?'), (match) {
+      index++;
+      values.add(parameters[index - 1]);
+      return '\$${index}';
+    });
     return (sql: normalized, values: values);
   }
 }
