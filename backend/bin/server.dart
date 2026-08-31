@@ -14,6 +14,40 @@ String hashPassword(String password) {
 
 String utcNow() => DateTime.now().toUtc().toIso8601String();
 
+class SuperAdminCredentials {
+  const SuperAdminCredentials({required this.username, required this.password});
+
+  final String username;
+  final String password;
+}
+
+SuperAdminCredentials resolveSuperAdminCredentials(Map<String, String> environment) {
+  final username = environment['SUPER_ADMIN_USERNAME']?.trim() ?? '';
+  final password = environment['SUPER_ADMIN_PASSWORD']?.trim() ?? '';
+  if (username.isEmpty || password.isEmpty) {
+    throw StateError('SUPER_ADMIN_USERNAME and SUPER_ADMIN_PASSWORD must be configured in the environment.');
+  }
+  return SuperAdminCredentials(username: username, password: password);
+}
+
+List<String> getShopCleanupTableOrder() => const [
+  'sync_records',
+  'products',
+  'sales',
+  'customers',
+  'employees',
+  'repairs',
+  'debtors',
+  'debt_transactions',
+  'accessories',
+  'mobile_devices',
+  'purchases',
+  'devices',
+  'sessions',
+  'users',
+  'shops',
+];
+
 String? authTokenFromRequest(shelf.Request request) {
   final authHeader = request.headers['authorization'];
   if (authHeader == null || !authHeader.startsWith('Bearer ')) {
@@ -401,6 +435,8 @@ class ServerApp {
     router.get('/api/health', _health);
     router.get('/api/super-admin/shops', _listShops);
     router.post('/api/super-admin/shops', _createShop);
+    router.delete('/api/super-admin/shops', _deleteShop);
+    router.delete('/api/super-admin/shops/:shopId', _deleteShop);
     router.post('/api/shops', _createShop);
     router.post('/api/auth/login', _login);
     router.post('/api/auth/logout', _logout);
@@ -414,22 +450,94 @@ class ServerApp {
   }
 
   Future<void> _seedSuperAdmin() async {
-    final existing = await db.select('SELECT id FROM super_admin WHERE id = 1');
-    if (existing.isNotEmpty) {
-      return;
-    }
+    final config = resolveSuperAdminCredentials(Platform.environment);
     final now = utcNow();
-    final username = Platform.environment['SUPER_ADMIN_USERNAME'] ?? 'admin';
-    final passwordHash = hashPassword(Platform.environment['SUPER_ADMIN_PASSWORD'] ?? 'admin123');
-    await db.execute(
-      'INSERT INTO super_admin (id, username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING',
-      [1, username, passwordHash, now, now],
+    final passwordHash = hashPassword(config.password);
+
+    final existingSuperAdmin = await db.select('SELECT id, username, password_hash FROM super_admin WHERE id = 1');
+    if (existingSuperAdmin.isEmpty) {
+      await db.execute(
+        'INSERT INTO super_admin (id, username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, password_hash = EXCLUDED.password_hash, updated_at = EXCLUDED.updated_at',
+        [1, config.username, passwordHash, now, now],
+      );
+    } else {
+      await db.execute(
+        'UPDATE super_admin SET username = ?, password_hash = ?, updated_at = ? WHERE id = 1',
+        [config.username, passwordHash, now],
+      );
+    }
+
+    final existingSuperAdminUser = await db.select(
+      'SELECT id FROM users WHERE shop_id = ? AND role = ?',
+      ['SUPER_ADMIN', 'super_admin'],
     );
-    final userId = const Uuid().v4();
+    final userId = existingSuperAdminUser.isNotEmpty ? existingSuperAdminUser.first['id'] as String : const Uuid().v4();
     await db.execute(
-      'INSERT INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, username) DO NOTHING',
-      [userId, username, passwordHash, 'SUPER_ADMIN', 'super_admin', now, now],
+      'INSERT INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, username) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = EXCLUDED.role, updated_at = EXCLUDED.updated_at',
+      [userId, config.username, passwordHash, 'SUPER_ADMIN', 'super_admin', now, now],
     );
+  }
+
+  Future<shelf.Response> _deleteShop(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null) {
+      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
+    }
+    if (auth['user']['role'] != 'super_admin') {
+      return shelf.Response(403, body: jsonEncode({'error': 'Super admin authorization required'}));
+    }
+
+    final shopId = request.params['shopId'] ?? (await _body(request))['shopId']?.toString() ?? '';
+    if (shopId.trim().isEmpty) {
+      return shelf.Response(400, body: jsonEncode({'error': 'shopId is required'}));
+    }
+
+    try {
+      final rows = await db.select('SELECT shop_id FROM shops WHERE shop_id = ?', [shopId]);
+      if (rows.isEmpty) {
+        return shelf.Response(404, body: jsonEncode({'error': 'Shop not found', 'shopId': shopId}));
+      }
+
+      final userRows = await db.select('SELECT id FROM users WHERE shop_id = ?', [shopId]);
+      final userIds = userRows.map<String>((row) => row['id'] as String).toList(growable: false);
+
+      await db.execute('BEGIN');
+      try {
+        if (userIds.isNotEmpty) {
+          final placeholders = List.filled(userIds.length, '?').join(', ');
+          await db.execute('DELETE FROM sessions WHERE user_id IN ($placeholders)', userIds);
+        }
+
+        for (final tableName in getShopCleanupTableOrder()) {
+          if (tableName == 'shops') {
+            await db.execute('DELETE FROM shops WHERE shop_id = ?', [shopId]);
+            continue;
+          }
+          if (tableName == 'sessions') {
+            continue;
+          }
+          if (tableName == 'users') {
+            await db.execute('DELETE FROM users WHERE shop_id = ?', [shopId]);
+            continue;
+          }
+          if (tableName == 'devices') {
+            await db.execute('DELETE FROM devices WHERE shop_id = ?', [shopId]);
+            continue;
+          }
+          await db.execute('DELETE FROM "$tableName" WHERE shop_id = ?', [shopId]);
+        }
+
+        await db.execute('DELETE FROM shops WHERE shop_id = ?', [shopId]);
+        await db.execute('COMMIT');
+      } catch (_) {
+        await db.execute('ROLLBACK');
+        rethrow;
+      }
+
+      return shelf.Response.ok(jsonEncode({'success': true, 'shopId': shopId, 'message': 'Shop deleted successfully'}));
+    } catch (error) {
+      return shelf.Response(500, body: jsonEncode({'error': 'Failed to delete shop', 'details': error.toString()}));
+    }
   }
 
   Future<shelf.Response> _health(shelf.Request request) async {
