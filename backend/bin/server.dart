@@ -735,14 +735,18 @@ class ServerApp {
       print(
         'Shop deletion authorized shopId=$shopId stage=transaction_start status=accepted',
       );
+      final shopScopedTables = await _shopScopedTables();
       await db.execute('BEGIN');
       try {
+        await db.execute("SET LOCAL lock_timeout = '5s'");
+        await db.execute("SET LOCAL statement_timeout = '12s'");
         if (userIds.isNotEmpty) {
           final placeholders = List.filled(userIds.length, '?').join(', ');
           await db.execute(
             'DELETE FROM sessions WHERE user_id IN ($placeholders)',
             userIds,
           );
+          print('Shop deletion stage=sessions completed shopId=$shopId');
         }
 
         const deletionOrder = [
@@ -768,32 +772,27 @@ class ServerApp {
         ];
         final deletedTables = deletionOrder.toSet();
         for (final tableName in deletionOrder) {
-          final columns = await db.select(
-            'SELECT column_name FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?',
-            ['public', tableName, 'shop_id'],
-          );
-          if (columns.isNotEmpty) {
-            print('Shop deletion stage=$tableName shopId=$shopId');
+          if (shopScopedTables.contains(tableName)) {
             await db.execute('DELETE FROM "$tableName" WHERE shop_id = ?', [
               shopId,
             ]);
+            print('Shop deletion stage=$tableName completed shopId=$shopId');
           }
         }
-        final additionalTables = await db.select(
-          'SELECT DISTINCT table_name FROM information_schema.columns WHERE table_schema = ? AND column_name = ? ORDER BY table_name',
-          ['public', 'shop_id'],
-        );
-        for (final row in additionalTables) {
-          final tableName = row['table_name']?.toString();
-          if (tableName == null || deletedTables.contains(tableName)) {
+        for (final tableName in shopScopedTables) {
+          if (deletedTables.contains(tableName)) {
             continue;
           }
-          print('Shop deletion stage=$tableName shopId=$shopId');
           await db.execute('DELETE FROM "$tableName" WHERE shop_id = ?', [
             shopId,
           ]);
+          print('Shop deletion stage=$tableName completed shopId=$shopId');
         }
+        print('Shop deletion stage=shop_record completed shopId=$shopId');
         await db.execute('COMMIT');
+        print(
+          'Shop deletion stage=transaction_commit completed shopId=$shopId',
+        );
       } catch (error, stackTrace) {
         await db.execute('ROLLBACK');
         print(
@@ -819,6 +818,17 @@ class ServerApp {
         body: jsonEncode({'error': 'Failed to delete shop'}),
       );
     }
+  }
+
+  Future<Set<String>> _shopScopedTables() async {
+    final rows = await db.select(
+      "SELECT DISTINCT table_name FROM information_schema.tables t JOIN information_schema.columns c USING (table_schema, table_name) WHERE t.table_schema = ? AND t.table_type = 'BASE TABLE' AND c.column_name = ?",
+      ['public', 'shop_id'],
+    );
+    return rows
+        .map((row) => row['table_name']?.toString())
+        .whereType<String>()
+        .toSet();
   }
 
   Future<shelf.Response> _createShop(shelf.Request request) async {
