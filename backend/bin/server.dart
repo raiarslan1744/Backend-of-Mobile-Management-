@@ -782,12 +782,35 @@ class ServerApp {
   }
 
   Future<shelf.Response> _login(shelf.Request request) async {
+    try {
+      return await _loginInternal(request);
+    } catch (error, stackTrace) {
+      final branch =
+          request.url.queryParameters['shopId']?.trim().isEmpty ?? true
+          ? 'super_admin'
+          : 'shop_admin_or_employee';
+      print(
+        'Auth login exception branch=$branch type=${error.runtimeType} message=$error stackTrace=$stackTrace',
+      );
+      return shelf.Response(
+        500,
+        body: jsonEncode({'error': 'Authentication server error'}),
+      );
+    }
+  }
+
+  Future<shelf.Response> _loginInternal(shelf.Request request) async {
     final stopwatch = Stopwatch()..start();
     final body = await _body(request);
     final username = body['username']?.toString().trim() ?? '';
     final suppliedShopId = body['shopId']?.toString().trim() ?? '';
     final password = body['password']?.toString() ?? '';
     final deviceId = body['deviceId']?.toString() ?? 'unknown-device';
+    if (Platform.environment['DART_ENV'] == 'development') {
+      print(
+        'Auth login start branch=${suppliedShopId.isEmpty ? 'super_admin' : 'shop_admin_or_employee'} elapsedMs=${stopwatch.elapsedMilliseconds}',
+      );
+    }
 
     final superAdminRows = await db.select(
       'SELECT * FROM users WHERE username = ? AND role = ? AND password_hash = ?',
@@ -889,20 +912,27 @@ class ServerApp {
       'createdAt': now,
     };
 
-    await db.execute(
-      'INSERT OR REPLACE INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [
-        const Uuid().v4(),
-        user['id'] as String,
-        shopId,
-        deviceId,
-        deviceId,
-        'Flutter Client',
-        'windows',
-        now,
-        now,
-      ],
-    );
+    try {
+      await db.execute(
+        'INSERT INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, device_id) DO UPDATE SET user_id = EXCLUDED.user_id, imei = EXCLUDED.imei, device_name = EXCLUDED.device_name, device_type = EXCLUDED.device_type, last_seen_at = EXCLUDED.last_seen_at',
+        [
+          const Uuid().v4(),
+          user['id'] as String,
+          shopId,
+          deviceId,
+          deviceId,
+          'Flutter Client',
+          'windows',
+          now,
+          now,
+        ],
+      );
+    } catch (error, stackTrace) {
+      print(
+        'Auth login device-write exception branch=${role == 'super_admin' ? 'super_admin' : 'shop_admin_or_employee'} type=${error.runtimeType} message=$error stackTrace=$stackTrace',
+      );
+      rethrow;
+    }
 
     if (Platform.environment['DART_ENV'] == 'development') {
       print(
