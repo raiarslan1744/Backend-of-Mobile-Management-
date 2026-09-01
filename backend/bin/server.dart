@@ -609,6 +609,8 @@ class ServerApp {
     router.get('/api/health', _health);
     router.get('/api/super-admin/shops', _listShops);
     router.post('/api/super-admin/shops', _createShop);
+    router.delete('/api/super-admin/shops', _deleteShop);
+    router.delete('/api/super-admin/shops/<shopId>', _deleteShop);
     router.post('/api/shops', _createShop);
     router.post('/api/auth/login', _login);
     router.post('/api/auth/logout', _logout);
@@ -674,6 +676,149 @@ class ServerApp {
         'database': 'connected',
       }),
     );
+  }
+
+  Future<shelf.Response> _deleteShop(shelf.Request request) async {
+    final requestedShopId =
+        request.params['shopId'] ??
+        (await _body(request))['shopId']?.toString() ??
+        '';
+    final shopId = requestedShopId.trim();
+    print('Shop deletion request received shopId=$shopId');
+
+    final auth = await _requireAuth(request);
+    if (auth == null) {
+      print(
+        'Shop deletion rejected shopId=$shopId stage=authorization status=401',
+      );
+      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
+    }
+    if (auth['user']['role'] != 'super_admin') {
+      print(
+        'Shop deletion rejected shopId=$shopId stage=authorization status=403',
+      );
+      return shelf.Response(
+        403,
+        body: jsonEncode({'error': 'Super admin authorization required'}),
+      );
+    }
+    if (shopId.isEmpty || shopId == 'SUPER_ADMIN') {
+      return shelf.Response(
+        400,
+        body: jsonEncode({'error': 'A valid shopId is required'}),
+      );
+    }
+
+    try {
+      final shopRows = await db.select(
+        'SELECT shop_id FROM shops WHERE shop_id = ?',
+        [shopId],
+      );
+      if (shopRows.isEmpty) {
+        print(
+          'Shop deletion completed shopId=$shopId stage=already_absent status=404',
+        );
+        return shelf.Response(
+          404,
+          body: jsonEncode({'error': 'Shop not found', 'shopId': shopId}),
+        );
+      }
+
+      final userRows = await db.select(
+        'SELECT id FROM users WHERE shop_id = ?',
+        [shopId],
+      );
+      final userIds = userRows
+          .map((row) => row['id'])
+          .whereType<String>()
+          .toList(growable: false);
+      print(
+        'Shop deletion authorized shopId=$shopId stage=transaction_start status=accepted',
+      );
+      await db.execute('BEGIN');
+      try {
+        if (userIds.isNotEmpty) {
+          final placeholders = List.filled(userIds.length, '?').join(', ');
+          await db.execute(
+            'DELETE FROM sessions WHERE user_id IN ($placeholders)',
+            userIds,
+          );
+        }
+
+        const deletionOrder = [
+          'sync_records',
+          'mobile_units',
+          'sales',
+          'returns',
+          'mobile_devices',
+          'accessories',
+          'purchases',
+          'suppliers',
+          'mobile_models',
+          'products',
+          'customers',
+          'employees',
+          'repairs',
+          'debt_transactions',
+          'debtors',
+          'bill_number_sequence',
+          'devices',
+          'users',
+          'shops',
+        ];
+        final deletedTables = deletionOrder.toSet();
+        for (final tableName in deletionOrder) {
+          final columns = await db.select(
+            'SELECT column_name FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?',
+            ['public', tableName, 'shop_id'],
+          );
+          if (columns.isNotEmpty) {
+            print('Shop deletion stage=$tableName shopId=$shopId');
+            await db.execute('DELETE FROM "$tableName" WHERE shop_id = ?', [
+              shopId,
+            ]);
+          }
+        }
+        final additionalTables = await db.select(
+          'SELECT DISTINCT table_name FROM information_schema.columns WHERE table_schema = ? AND column_name = ? ORDER BY table_name',
+          ['public', 'shop_id'],
+        );
+        for (final row in additionalTables) {
+          final tableName = row['table_name']?.toString();
+          if (tableName == null || deletedTables.contains(tableName)) {
+            continue;
+          }
+          print('Shop deletion stage=$tableName shopId=$shopId');
+          await db.execute('DELETE FROM "$tableName" WHERE shop_id = ?', [
+            shopId,
+          ]);
+        }
+        await db.execute('COMMIT');
+      } catch (error, stackTrace) {
+        await db.execute('ROLLBACK');
+        print(
+          'Shop deletion database error shopId=$shopId stage=rollback type=${error.runtimeType} message=$error stackTrace=$stackTrace',
+        );
+        rethrow;
+      }
+
+      print('Shop deletion completed shopId=$shopId stage=commit status=200');
+      return shelf.Response.ok(
+        jsonEncode({
+          'success': true,
+          'shopId': shopId,
+          'message': 'Shop deleted successfully',
+        }),
+      );
+    } catch (error, stackTrace) {
+      print(
+        'Shop deletion database error shopId=$shopId stage=failed type=${error.runtimeType} message=$error stackTrace=$stackTrace',
+      );
+      return shelf.Response(
+        500,
+        body: jsonEncode({'error': 'Failed to delete shop'}),
+      );
+    }
   }
 
   Future<shelf.Response> _createShop(shelf.Request request) async {
