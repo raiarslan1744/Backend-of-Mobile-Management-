@@ -1105,7 +1105,7 @@ class ServerApp {
     final modelId = request.url.queryParameters['modelId'];
     
     String sql = 'SELECT * FROM mobile_units WHERE shop_id = ?';
-    final params = [shopId];
+    final params = <Object?>[shopId];
     
     if (modelId != null) {
       sql += ' AND mobile_model_id = ?';
@@ -1188,7 +1188,7 @@ class ServerApp {
     final billNumber = request.url.queryParameters['billNumber'];
     
     String sql = 'SELECT * FROM returns WHERE shop_id = ? AND is_deleted = 0';
-    final params = [shopId];
+    final params = <Object?>[shopId];
     
     if (billNumber != null) {
       sql += ' AND bill_number = ?';
