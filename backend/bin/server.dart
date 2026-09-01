@@ -14,58 +14,6 @@ String hashPassword(String password) {
 
 String utcNow() => DateTime.now().toUtc().toIso8601String();
 
-class SuperAdminCredentials {
-  const SuperAdminCredentials({required this.username, required this.password});
-
-  final String username;
-  final String password;
-}
-
-class SuperAdminUserSeedResult {
-  const SuperAdminUserSeedResult({required this.shouldInsert, required this.existingUserId});
-
-  final bool shouldInsert;
-  final String? existingUserId;
-}
-
-SuperAdminCredentials resolveSuperAdminCredentials(Map<String, String> environment) {
-  final username = environment['SUPER_ADMIN_USERNAME']?.trim() ?? '';
-  final password = environment['SUPER_ADMIN_PASSWORD']?.trim() ?? '';
-  if (username.isEmpty || password.isEmpty) {
-    throw StateError('SUPER_ADMIN_USERNAME and SUPER_ADMIN_PASSWORD must be configured in the environment.');
-  }
-  return SuperAdminCredentials(username: username, password: password);
-}
-
-SuperAdminUserSeedResult resolveSuperAdminUserAction(List<Map<String, Object?>> existingUsers) {
-  for (final row in existingUsers) {
-    final role = row['role']?.toString() ?? '';
-    final shopId = row['shop_id']?.toString() ?? '';
-    if (role == 'super_admin' || shopId == 'SUPER_ADMIN') {
-      return SuperAdminUserSeedResult(shouldInsert: false, existingUserId: row['id']?.toString());
-    }
-  }
-  return const SuperAdminUserSeedResult(shouldInsert: true, existingUserId: null);
-}
-
-List<String> getShopCleanupTableOrder() => const [
-  'sync_records',
-  'products',
-  'sales',
-  'customers',
-  'employees',
-  'repairs',
-  'debtors',
-  'debt_transactions',
-  'accessories',
-  'mobile_devices',
-  'purchases',
-  'devices',
-  'sessions',
-  'users',
-  'shops',
-];
-
 String? authTokenFromRequest(shelf.Request request) {
   final authHeader = request.headers['authorization'];
   if (authHeader == null || !authHeader.startsWith('Bearer ')) {
@@ -75,68 +23,99 @@ String? authTokenFromRequest(shelf.Request request) {
 }
 
 class DatabaseAdapter {
-  DatabaseAdapter._({required this.postgresConnection});
+  DatabaseAdapter._(this.postgresConnection);
 
-  final Connection? postgresConnection;
+  final Connection postgresConnection;
 
   static Future<DatabaseAdapter> open() async {
     final databaseUrl = Platform.environment['DATABASE_URL'];
     if (databaseUrl == null || databaseUrl.trim().isEmpty) {
-      throw StateError('DATABASE_URL is required for the production backend.');
+      throw StateError('DATABASE_URL is required for the production backend');
     }
-
     final connection = await Connection.openFromUrl(databaseUrl);
-    return DatabaseAdapter._(postgresConnection: connection);
+    return DatabaseAdapter._(connection);
   }
 
   Future<List<Map<String, Object?>>> select(String sql, [List<Object?> parameters = const []]) async {
     final normalized = _normalizeSql(sql, parameters);
-    final result = await postgresConnection!.execute(
-      normalized.sql,
-      parameters: normalized.values,
-    );
+    final result = await postgresConnection.execute(normalized.sql, parameters: normalized.values);
     return result.map((row) => Map<String, Object?>.from(row.toColumnMap())).toList(growable: false);
   }
 
   Future<void> execute(String sql, [List<Object?> parameters = const []]) async {
     final normalized = _normalizeSql(sql, parameters);
-    await postgresConnection!.execute(
-      normalized.sql,
-      parameters: normalized.values,
-    );
+    await postgresConnection.execute(normalized.sql, parameters: normalized.values);
   }
 
   Future<void> dispose() async {
-    await postgresConnection?.close();
+    await postgresConnection.close();
   }
 
   ({String sql, List<Object?> values}) _normalizeSql(String sql, List<Object?> parameters) {
-    final trimmed = sql.trim();
-    if (parameters.isEmpty) {
-      return (sql: trimmed, values: const []);
-    }
-
-    if (RegExp(r'\$\d+').hasMatch(trimmed)) {
-      return (sql: trimmed, values: parameters);
-    }
-
-    var normalized = trimmed;
+    var normalized = _postgresify(sql);
     final values = <Object?>[];
-    var index = 0;
-    normalized = normalized.replaceAllMapped(RegExp(r'\?'), (match) {
-      index++;
-      values.add(parameters[index - 1]);
-      return '\$${index}';
-    });
+    if (parameters.isNotEmpty) {
+      var index = 0;
+      normalized = normalized.replaceAllMapped(RegExp(r'\?'), (match) {
+        index++;
+        values.add(parameters[index - 1]);
+        return '\$$index';
+      });
+    }
     return (sql: normalized, values: values);
+  }
+
+  String _postgresify(String sql) {
+    var normalized = sql.trim();
+    normalized = normalized.replaceAll(RegExp(r'\bAUTOINCREMENT\b', caseSensitive: false), '');
+    normalized = normalized.replaceAll(RegExp(r'\bINTEGER PRIMARY KEY\b', caseSensitive: false), 'BIGSERIAL PRIMARY KEY');
+    normalized = normalized.replaceAll(RegExp(r'\bCURRENT_TIMESTAMP\b', caseSensitive: false), 'NOW()');
+    normalized = _rewriteInsertOrReplace(normalized);
+    normalized = _rewriteInsertOrIgnore(normalized);
+    return normalized;
+  }
+
+  String _rewriteInsertOrReplace(String sql) {
+    final match = RegExp(
+      r'INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\((.*)\)',
+      caseSensitive: false,
+    ).firstMatch(sql);
+    if (match == null) {
+      return sql;
+    }
+
+    final table = match.group(1)!;
+    final columns = match.group(2)!.split(',').map((column) => column.trim()).where((column) => column.isNotEmpty).toList();
+    final values = match.group(3)!;
+    final assignments = columns
+        .where((column) => column.toLowerCase() != 'id')
+        .map((column) => '"$column" = EXCLUDED."$column"')
+        .join(', ');
+    return 'INSERT INTO "$table" (${columns.map((column) => '"$column"').join(', ')}) VALUES ($values) ON CONFLICT ("id") DO UPDATE SET $assignments';
+  }
+
+  String _rewriteInsertOrIgnore(String sql) {
+    final match = RegExp(
+      r'INSERT\s+OR\s+IGNORE\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\((.*)\)',
+      caseSensitive: false,
+    ).firstMatch(sql);
+    if (match == null) {
+      return sql;
+    }
+
+    final table = match.group(1)!;
+    final columns = match.group(2)!.split(',').map((column) => column.trim()).where((column) => column.isNotEmpty).toList();
+    final values = match.group(3)!;
+    return 'INSERT INTO "$table" (${columns.map((column) => '"$column"').join(', ')}) VALUES ($values) ON CONFLICT DO NOTHING';
   }
 }
 
 class ServerApp {
-  ServerApp._(this.db);
+  ServerApp._(this.dbPath, this.db);
 
   static ServerApp? _activeInstance;
 
+  final String dbPath;
   final DatabaseAdapter db;
   final Router router = Router();
   HttpServer? _httpServer;
@@ -153,7 +132,7 @@ class ServerApp {
     }
 
     final database = await DatabaseAdapter.open();
-    final app = ServerApp._(database);
+    final app = ServerApp._(dbPath ?? 'postgresql', database);
     await app._initializeSchema();
     app._registerRoutes();
     _activeInstance = app;
@@ -194,10 +173,11 @@ class ServerApp {
         address TEXT NOT NULL,
         username TEXT NOT NULL,
         password_hash TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )
-    ''');
+    ''' );
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS super_admin (
@@ -207,7 +187,7 @@ class ServerApp {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )
-    ''');
+    ''' );
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS users (
@@ -220,7 +200,9 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         UNIQUE(shop_id, username)
       )
-    ''');
+    ''' );
+
+    await _seedSuperAdmin();
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS sessions (
@@ -231,7 +213,7 @@ class ServerApp {
         expires_at TEXT NOT NULL,
         created_at TEXT NOT NULL
       )
-    ''');
+    ''' );
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS devices (
@@ -246,7 +228,7 @@ class ServerApp {
         last_seen_at TEXT NOT NULL,
         UNIQUE(shop_id, device_id)
       )
-    ''');
+    ''' );
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS sync_records (
@@ -260,7 +242,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''');
+    ''' );
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS products (
@@ -273,7 +255,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''');
+    ''' );
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS sales (
@@ -293,7 +275,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''');
+    ''' );
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS customers (
@@ -306,7 +288,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''');
+    ''' );
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS employees (
@@ -320,7 +302,7 @@ class ServerApp {
         is_deleted INTEGER NOT NULL DEFAULT 0,
         UNIQUE(shop_id, username)
       )
-    ''');
+    ''' );
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS repairs (
@@ -334,7 +316,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''');
+    ''' );
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS debtors (
@@ -347,7 +329,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''');
+    ''' );
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS debt_transactions (
@@ -361,7 +343,10 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''');
+    ''' );
+    try {
+      await db.execute('ALTER TABLE debt_transactions ADD COLUMN shop_id TEXT NOT NULL DEFAULT ""');
+    } catch (_) {}
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS accessories (
@@ -375,7 +360,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''');
+    ''' );
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS mobile_devices (
@@ -392,7 +377,7 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''');
+    ''' );
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS purchases (
@@ -405,47 +390,101 @@ class ServerApp {
         updated_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0
       )
-    ''');
+    ''' );
 
-    await db.execute('CREATE INDEX IF NOT EXISTS idx_sync_records_shop_updated ON sync_records(shop_id, updated_at)');
-    await db.execute('CREATE INDEX IF NOT EXISTS idx_records_entity_type ON sync_records(entity_type, entity_id)');
-    await db.execute('CREATE INDEX IF NOT EXISTS idx_users_shop ON users(shop_id)');
-    await db.execute('CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token)');
+    // New tables for inventory workflow
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS mobile_models (
+        id BIGSERIAL PRIMARY KEY,
+        shop_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        image TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    ''' );
 
-    await _ensureTableColumns();
-    await _seedSuperAdmin();
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS mobile_units (
+        id BIGSERIAL PRIMARY KEY,
+        shop_id TEXT NOT NULL,
+        mobile_model_id BIGINT NOT NULL,
+        imei_1 TEXT NOT NULL UNIQUE,
+        imei_2 TEXT,
+        buy_price REAL NOT NULL DEFAULT 0,
+        ram TEXT,
+        storage TEXT,
+        supplier_id BIGINT,
+        status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'sold', 'returned')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    ''' );
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS suppliers (
+        id BIGSERIAL PRIMARY KEY,
+        shop_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        phone TEXT,
+        address TEXT,
+        notes TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    ''' );
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS bill_number_sequence (
+        shop_id TEXT PRIMARY KEY,
+        next_number BIGINT NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL
+      )
+    ''' );
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS returns (
+        id BIGSERIAL PRIMARY KEY,
+        shop_id TEXT NOT NULL,
+        sale_id TEXT,
+        sale_item_id BIGINT,
+        mobile_unit_id BIGINT,
+        bill_number TEXT,
+        returned_at TEXT NOT NULL,
+        return_reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        is_deleted INTEGER NOT NULL DEFAULT 0
+      )
+    ''' );
+
+    await _ensureColumn('sales', 'bill_number', 'TEXT');
+
   }
 
   Future<void> _ensureTableColumns() async {
-    await _ensureColumn('debt_transactions', 'shop_id', 'TEXT NOT NULL DEFAULT \"\"');
+    await _ensureColumn('debt_transactions', 'shop_id', "TEXT NOT NULL DEFAULT ''");
+    await _ensureColumn('shops', 'status', "TEXT NOT NULL DEFAULT 'active'");
   }
 
   Future<bool> _tableExists(String tableName) async {
     final rows = await db.select(
-      'SELECT EXISTS ( SELECT 1 FROM information_schema.tables WHERE table_schema = \$1 AND table_name = \$2 ) AS table_exists',
+      'SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name = ?',
       ['public', tableName],
     );
-    return rows.isNotEmpty && (rows.first['table_exists'] == true);
+    return rows.isNotEmpty;
   }
 
   Future<void> _ensureColumn(String tableName, String columnName, String columnDefinition) async {
     if (!await _tableExists(tableName)) return;
-
-    final rows = await db.select(
-      'SELECT EXISTS ( SELECT 1 FROM information_schema.columns WHERE table_schema = \$1 AND table_name = \$2 AND column_name = \$3 ) AS column_exists',
+    final columns = await db.select(
+      'SELECT column_name FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?',
       ['public', tableName, columnName],
     );
-    if (rows.isNotEmpty && (rows.first['column_exists'] == true)) {
-      return;
+    final exists = columns.isNotEmpty;
+    if (!exists) {
+      await db.execute('ALTER TABLE $tableName ADD COLUMN $columnName $columnDefinition');
     }
-
-    final quotedTable = _quoteIdentifier(tableName);
-    final quotedColumn = _quoteIdentifier(columnName);
-    await db.execute('ALTER TABLE $quotedTable ADD COLUMN IF NOT EXISTS $quotedColumn $columnDefinition');
-  }
-
-  String _quoteIdentifier(String identifier) {
-    return '"${identifier.replaceAll('"', '""')}"';
   }
 
   void _registerRoutes() {
@@ -453,8 +492,6 @@ class ServerApp {
     router.get('/api/health', _health);
     router.get('/api/super-admin/shops', _listShops);
     router.post('/api/super-admin/shops', _createShop);
-    router.delete('/api/super-admin/shops', _deleteShop);
-    router.delete('/api/super-admin/shops/:shopId', _deleteShop);
     router.post('/api/shops', _createShop);
     router.post('/api/auth/login', _login);
     router.post('/api/auth/logout', _logout);
@@ -465,107 +502,36 @@ class ServerApp {
     router.get('/api/sync/initial', _initialSync);
     router.post('/api/sync/conflict-report', _reportConflict);
     router.post('/api/employees', _createEmployee);
+    
+    // New inventory workflow endpoints
+    router.post('/api/mobile-models', _createMobileModel);
+    router.get('/api/mobile-models', _getMobileModels);
+    router.post('/api/mobile-units', _createMobileUnit);
+    router.get('/api/mobile-units', _getMobileUnits);
+    router.post('/api/suppliers', _createSupplier);
+    router.get('/api/suppliers', _getSuppliers);
+    router.post('/api/returns', _createReturn);
+    router.get('/api/returns', _getReturns);
+    router.get('/api/bill-number', _generateBillNumber);
   }
 
   Future<void> _seedSuperAdmin() async {
-    final config = resolveSuperAdminCredentials(Platform.environment);
-    final now = utcNow();
-    final passwordHash = hashPassword(config.password);
-
-    final existingSuperAdmin = await db.select('SELECT id, username, password_hash FROM super_admin WHERE id = 1 LIMIT 1');
-    if (existingSuperAdmin.isEmpty) {
-      await db.execute(
-        'INSERT INTO super_admin (id, username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, password_hash = EXCLUDED.password_hash, updated_at = EXCLUDED.updated_at',
-        [1, config.username, passwordHash, now, now],
-      );
-    } else {
-      await db.execute(
-        'UPDATE super_admin SET username = ?, password_hash = ?, updated_at = ? WHERE id = 1',
-        [config.username, passwordHash, now],
-      );
-    }
-
-    final existingSuperAdminUsers = await db.select(
-      'SELECT id, role, shop_id FROM users WHERE role = ? OR shop_id = ? ORDER BY created_at DESC LIMIT 1',
-      ['super_admin', 'SUPER_ADMIN'],
-    );
-    final userAction = resolveSuperAdminUserAction(existingSuperAdminUsers);
-    final stableUserId = userAction.existingUserId ?? 'SUPER_ADMIN';
-
-    if (userAction.shouldInsert) {
-      await db.execute(
-        'INSERT INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, password_hash = EXCLUDED.password_hash, shop_id = EXCLUDED.shop_id, role = EXCLUDED.role, updated_at = EXCLUDED.updated_at',
-        [stableUserId, config.username, passwordHash, 'SUPER_ADMIN', 'super_admin', now, now],
-      );
+    final existing = await db.select('SELECT id FROM super_admin WHERE id = 1');
+    if (existing.isNotEmpty) {
       return;
     }
-
+    final now = utcNow();
+    final username = Platform.environment['SUPER_ADMIN_USERNAME'] ?? 'admin';
+    final passwordHash = hashPassword(Platform.environment['SUPER_ADMIN_PASSWORD'] ?? 'admin123');
     await db.execute(
-      'UPDATE users SET username = ?, password_hash = ?, shop_id = ?, role = ?, updated_at = ? WHERE id = ?',
-      [config.username, passwordHash, 'SUPER_ADMIN', 'super_admin', now, stableUserId],
+      'INSERT INTO super_admin (id, username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+      [1, username, passwordHash, now, now],
     );
-  }
-
-  Future<shelf.Response> _deleteShop(shelf.Request request) async {
-    final auth = await _requireAuth(request);
-    if (auth == null) {
-      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
-    }
-    if (auth['user']['role'] != 'super_admin') {
-      return shelf.Response(403, body: jsonEncode({'error': 'Super admin authorization required'}));
-    }
-
-    final shopId = request.params['shopId'] ?? (await _body(request))['shopId']?.toString() ?? '';
-    if (shopId.trim().isEmpty) {
-      return shelf.Response(400, body: jsonEncode({'error': 'shopId is required'}));
-    }
-
-    try {
-      final rows = await db.select('SELECT shop_id FROM shops WHERE shop_id = ?', [shopId]);
-      if (rows.isEmpty) {
-        return shelf.Response(404, body: jsonEncode({'error': 'Shop not found', 'shopId': shopId}));
-      }
-
-      final userRows = await db.select('SELECT id FROM users WHERE shop_id = ?', [shopId]);
-      final userIds = userRows.map<String>((row) => row['id'] as String).toList(growable: false);
-
-      await db.execute('BEGIN');
-      try {
-        if (userIds.isNotEmpty) {
-          final placeholders = List.filled(userIds.length, '?').join(', ');
-          await db.execute('DELETE FROM sessions WHERE user_id IN ($placeholders)', userIds);
-        }
-
-        for (final tableName in getShopCleanupTableOrder()) {
-          if (tableName == 'shops') {
-            await db.execute('DELETE FROM shops WHERE shop_id = ?', [shopId]);
-            continue;
-          }
-          if (tableName == 'sessions') {
-            continue;
-          }
-          if (tableName == 'users') {
-            await db.execute('DELETE FROM users WHERE shop_id = ?', [shopId]);
-            continue;
-          }
-          if (tableName == 'devices') {
-            await db.execute('DELETE FROM devices WHERE shop_id = ?', [shopId]);
-            continue;
-          }
-          await db.execute('DELETE FROM "$tableName" WHERE shop_id = ?', [shopId]);
-        }
-
-        await db.execute('DELETE FROM shops WHERE shop_id = ?', [shopId]);
-        await db.execute('COMMIT');
-      } catch (_) {
-        await db.execute('ROLLBACK');
-        rethrow;
-      }
-
-      return shelf.Response.ok(jsonEncode({'success': true, 'shopId': shopId, 'message': 'Shop deleted successfully'}));
-    } catch (error) {
-      return shelf.Response(500, body: jsonEncode({'error': 'Failed to delete shop', 'details': error.toString()}));
-    }
+    final userId = const Uuid().v4();
+    await db.execute(
+      'INSERT OR IGNORE INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [userId, username, passwordHash, 'SUPER_ADMIN', 'super_admin', now, now],
+    );
   }
 
   Future<shelf.Response> _health(shelf.Request request) async {
@@ -586,6 +552,7 @@ class ServerApp {
     final shopId = (body['shopId'] ?? body['shop_id'])?.toString() ?? '';
     final username = (body['username'] ?? 'admin').toString();
     final password = (body['password'] ?? 'admin123').toString();
+    final passwordHash = body['passwordHash']?.toString();
     if (shopId.isEmpty) {
       return shelf.Response(400, body: jsonEncode({'error': 'shopId is required'}));
     }
@@ -598,13 +565,13 @@ class ServerApp {
     final now = utcNow();
     await db.execute(
       'INSERT INTO shops (shop_id, owner_name, contact, address, username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [shopId, (body['ownerName'] ?? 'Shop Owner').toString(), (body['contact'] ?? '').toString(), (body['address'] ?? '').toString(), username, hashPassword(password), now, now],
+      [shopId, (body['ownerName'] ?? 'Shop Owner').toString(), (body['contact'] ?? '').toString(), (body['address'] ?? '').toString(), username, passwordHash ?? hashPassword(password), now, now],
     );
 
     final userId = const Uuid().v4();
     await db.execute(
-      'INSERT INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, username) DO NOTHING',
-      [userId, username, hashPassword(password), shopId, 'admin', now, now],
+      'INSERT OR IGNORE INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [userId, username, passwordHash ?? hashPassword(password), shopId, 'admin', now, now],
     );
 
     return shelf.Response.ok(jsonEncode({'success': true, 'shopId': shopId, 'username': username}));
@@ -703,7 +670,7 @@ class ServerApp {
     };
 
     await db.execute(
-      'INSERT INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, device_id) DO UPDATE SET user_id = EXCLUDED.user_id, imei = EXCLUDED.imei, device_name = EXCLUDED.device_name, device_type = EXCLUDED.device_type, last_seen_at = EXCLUDED.last_seen_at',
+      'INSERT OR REPLACE INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [const Uuid().v4(), user['id'] as String, shopId, deviceId, deviceId, 'Flutter Client', 'windows', now, now],
     );
 
@@ -744,7 +711,7 @@ class ServerApp {
     final userId = auth['user']['id'] as String;
     final now = utcNow();
     await db.execute(
-      'INSERT INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, device_id) DO UPDATE SET user_id = EXCLUDED.user_id, imei = EXCLUDED.imei, device_name = EXCLUDED.device_name, device_type = EXCLUDED.device_type, last_seen_at = EXCLUDED.last_seen_at',
+      'INSERT OR REPLACE INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [const Uuid().v4(), userId, shopId, deviceId, body['imei']?.toString() ?? deviceId, body['deviceName']?.toString() ?? 'Flutter Client', body['deviceType']?.toString() ?? 'windows', now, now],
     );
     return shelf.Response.ok(jsonEncode({'registered': true, 'deviceId': deviceId}));
@@ -780,7 +747,7 @@ class ServerApp {
       final recordId = map['id']?.toString() ?? const Uuid().v4();
       final recordTs = (map['createdAt'] ?? now).toString();
 
-      await db.execute('INSERT INTO sync_records (id, shop_id, entity_type, entity_id, operation, data, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET shop_id = EXCLUDED.shop_id, entity_type = EXCLUDED.entity_type, entity_id = EXCLUDED.entity_id, operation = EXCLUDED.operation, data = EXCLUDED.data, updated_at = EXCLUDED.updated_at, is_deleted = EXCLUDED.is_deleted', [
+      await db.execute('INSERT OR REPLACE INTO sync_records (id, shop_id, entity_type, entity_id, operation, data, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [
         recordId,
         shopId,
         entityType,
@@ -864,6 +831,10 @@ class ServerApp {
       'accessories': await _fetchTableRows('accessories', shopId),
       'mobile_devices': await _fetchTableRows('mobile_devices', shopId),
       'purchases': await _fetchTableRows('purchases', shopId),
+      'mobile_models': await _fetchTableRows('mobile_models', shopId),
+      'mobile_units': await _fetchTableRows('mobile_units', shopId),
+      'suppliers': await _fetchTableRows('suppliers', shopId),
+      'returns': await _fetchTableRows('returns', shopId),
     };
 
     return shelf.Response.ok(jsonEncode(payload));
@@ -881,7 +852,7 @@ class ServerApp {
     final shopId = auth['user']['shop_id'] as String;
     final now = utcNow();
     await db.execute(
-      'INSERT INTO sync_records (id, shop_id, entity_type, entity_id, operation, data, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET shop_id = EXCLUDED.shop_id, entity_type = EXCLUDED.entity_type, entity_id = EXCLUDED.entity_id, operation = EXCLUDED.operation, data = EXCLUDED.data, updated_at = EXCLUDED.updated_at, is_deleted = EXCLUDED.is_deleted',
+      'INSERT OR REPLACE INTO sync_records (id, shop_id, entity_type, entity_id, operation, data, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [const Uuid().v4(), shopId, 'conflict', '$entityType:$entityId', 'conflict', jsonEncode(conflict), now, now, 0],
     );
     return shelf.Response.ok(jsonEncode({'resolved': true, 'entityType': entityType, 'entityId': entityId}));
@@ -908,11 +879,11 @@ class ServerApp {
     final now = utcNow();
     final passwordHash = hashPassword(password);
     await db.execute(
-      'INSERT INTO employees (id, shop_id, username, password_hash, status, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET shop_id = EXCLUDED.shop_id, username = EXCLUDED.username, password_hash = EXCLUDED.password_hash, status = EXCLUDED.status, updated_at = EXCLUDED.updated_at, is_deleted = EXCLUDED.is_deleted',
+      'INSERT OR REPLACE INTO employees (id, shop_id, username, password_hash, status, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [employeeId, shopId, username, passwordHash, body['status']?.toString() ?? 'active', now, now, 0],
     );
     await db.execute(
-      'INSERT INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, username) DO UPDATE SET password_hash = EXCLUDED.password_hash, updated_at = EXCLUDED.updated_at, role = EXCLUDED.role',
+      'INSERT OR REPLACE INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [employeeId, username, passwordHash, shopId, 'employee', now, now],
     );
 
@@ -1024,6 +995,18 @@ class ServerApp {
         case 'purchase':
           await _upsertEntity('purchases', cleaned, operation);
           return true;
+        case 'mobile_model':
+          await _upsertEntity('mobile_models', cleaned, operation);
+          return true;
+        case 'mobile_unit':
+          await _upsertEntity('mobile_units', cleaned, operation);
+          return true;
+        case 'supplier':
+          await _upsertEntity('suppliers', cleaned, operation);
+          return true;
+        case 'return':
+          await _upsertEntity('returns', cleaned, operation);
+          return true;
         default:
           return false;
       }
@@ -1034,8 +1017,7 @@ class ServerApp {
 
   Future<void> _upsertEntity(String tableName, Map<String, dynamic> row, String operation) async {
     final columns = row.keys.toList();
-    final quotedColumns = columns.map((column) => '"$column"').join(', ');
-    final createClause = 'INSERT INTO "$tableName" ($quotedColumns) VALUES (${List.filled(columns.length, '?').join(', ')}) ON CONFLICT (id) DO UPDATE SET ${columns.map((column) => '"$column" = EXCLUDED."$column"').join(', ')}';
+    final createClause = 'INSERT INTO $tableName (${columns.join(', ')}) VALUES (${List.filled(columns.length, '?').join(', ')}) ON CONFLICT(id) DO UPDATE SET ${columns.map((column) => '$column = excluded.$column').join(', ')}';
     final values = columns.map((column) => row[column]).toList();
 
     if (operation == 'delete') {
@@ -1047,6 +1029,213 @@ class ServerApp {
     }
 
     await db.execute(createClause, values);
+  }
+
+  // Mobile Model Endpoints
+  Future<shelf.Response> _createMobileModel(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null) {
+      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
+    }
+    final shopId = auth['user']['shop_id'] as String;
+    final body = await _body(request);
+    final name = body['name']?.toString() ?? '';
+    final image = body['image']?.toString();
+
+    if (name.isEmpty) {
+      return shelf.Response(400, body: jsonEncode({'error': 'Model name is required'}));
+    }
+
+    final now = utcNow();
+    await db.execute(
+      'INSERT INTO mobile_models (shop_id, name, image, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+      [shopId, name, image, now, now],
+    );
+    return shelf.Response.ok(jsonEncode({'success': true, 'shopId': shopId}));
+  }
+
+  Future<shelf.Response> _getMobileModels(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null) {
+      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
+    }
+    final shopId = auth['user']['shop_id'] as String;
+    final rows = await db.select('SELECT * FROM mobile_models WHERE shop_id = ? ORDER BY created_at DESC', [shopId]);
+    return shelf.Response.ok(jsonEncode(rows));
+  }
+
+  // Mobile Unit Endpoints
+  Future<shelf.Response> _createMobileUnit(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null) {
+      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
+    }
+    final shopId = auth['user']['shop_id'] as String;
+    final body = await _body(request);
+    final mobileModelId = body['mobileModelId'];
+    final imei1 = body['imei1']?.toString() ?? '';
+    final imei2 = body['imei2']?.toString();
+    final buyPrice = (body['buyPrice'] as num?)?.toDouble() ?? 0;
+    final ram = body['ram']?.toString();
+    final storage = body['storage']?.toString();
+    final supplierId = body['supplierId'];
+
+    if (imei1.isEmpty || buyPrice <= 0) {
+      return shelf.Response(400, body: jsonEncode({'error': 'IMEI and buyPrice are required'}));
+    }
+
+    try {
+      final now = utcNow();
+      await db.execute(
+        'INSERT INTO mobile_units (shop_id, mobile_model_id, imei_1, imei_2, buy_price, ram, storage, supplier_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [shopId, mobileModelId, imei1, imei2, buyPrice, ram, storage, supplierId, 'available', now, now],
+      );
+      return shelf.Response.ok(jsonEncode({'success': true}));
+    } catch (e) {
+      return shelf.Response(400, body: jsonEncode({'error': 'IMEI already exists or invalid data'}));
+    }
+  }
+
+  Future<shelf.Response> _getMobileUnits(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null) {
+      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
+    }
+    final shopId = auth['user']['shop_id'] as String;
+    final modelId = request.url.queryParameters['modelId'];
+    
+    String sql = 'SELECT * FROM mobile_units WHERE shop_id = ?';
+    final params = [shopId];
+    
+    if (modelId != null) {
+      sql += ' AND mobile_model_id = ?';
+      params.add(int.parse(modelId));
+    }
+    
+    sql += ' ORDER BY created_at DESC';
+    final rows = await db.select(sql, params);
+    return shelf.Response.ok(jsonEncode(rows));
+  }
+
+  // Supplier Endpoints
+  Future<shelf.Response> _createSupplier(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null) {
+      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
+    }
+    final shopId = auth['user']['shop_id'] as String;
+    final body = await _body(request);
+    final name = body['name']?.toString() ?? '';
+    final phone = body['phone']?.toString();
+    final address = body['address']?.toString();
+    final notes = body['notes']?.toString();
+
+    if (name.isEmpty) {
+      return shelf.Response(400, body: jsonEncode({'error': 'Supplier name is required'}));
+    }
+
+    final now = utcNow();
+    await db.execute(
+      'INSERT INTO suppliers (shop_id, name, phone, address, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [shopId, name, phone, address, notes, now, now],
+    );
+    return shelf.Response.ok(jsonEncode({'success': true}));
+  }
+
+  Future<shelf.Response> _getSuppliers(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null) {
+      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
+    }
+    final shopId = auth['user']['shop_id'] as String;
+    final rows = await db.select('SELECT * FROM suppliers WHERE shop_id = ? ORDER BY created_at DESC', [shopId]);
+    return shelf.Response.ok(jsonEncode(rows));
+  }
+
+  // Return Endpoints
+  Future<shelf.Response> _createReturn(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null) {
+      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
+    }
+    final shopId = auth['user']['shop_id'] as String;
+    final body = await _body(request);
+    final saleId = body['saleId'];
+    final mobileUnitId = body['mobileUnitId'];
+    final billNumber = body['billNumber']?.toString();
+    final returnReason = body['returnReason']?.toString();
+
+    final now = utcNow();
+    await db.execute(
+      'INSERT INTO returns (shop_id, sale_id, mobile_unit_id, bill_number, returned_at, return_reason, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [shopId, saleId, mobileUnitId, billNumber, now, returnReason, now, now, 0],
+    );
+    
+    // Restore mobile unit status if applicable
+    if (mobileUnitId != null) {
+      await db.execute('UPDATE mobile_units SET status = ?, updated_at = ? WHERE id = ?', ['available', now, mobileUnitId]);
+    }
+
+    return shelf.Response.ok(jsonEncode({'success': true}));
+  }
+
+  Future<shelf.Response> _getReturns(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null) {
+      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
+    }
+    final shopId = auth['user']['shop_id'] as String;
+    final billNumber = request.url.queryParameters['billNumber'];
+    
+    String sql = 'SELECT * FROM returns WHERE shop_id = ? AND is_deleted = 0';
+    final params = [shopId];
+    
+    if (billNumber != null) {
+      sql += ' AND bill_number = ?';
+      params.add(billNumber);
+    }
+    
+    sql += ' ORDER BY returned_at DESC';
+    final rows = await db.select(sql, params);
+    return shelf.Response.ok(jsonEncode(rows));
+  }
+
+  // Bill Number Endpoint
+  Future<shelf.Response> _generateBillNumber(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null) {
+      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
+    }
+    final shopId = auth['user']['shop_id'] as String;
+
+    try {
+      final existing = await db.select(
+        'SELECT next_number FROM bill_number_sequence WHERE shop_id = ?',
+        [shopId],
+      );
+
+      late int nextNumber;
+      if (existing.isEmpty) {
+        nextNumber = 1;
+        final now = utcNow();
+        await db.execute(
+          'INSERT INTO bill_number_sequence (shop_id, next_number, updated_at) VALUES (?, ?, ?)',
+          [shopId, 2, now],
+        );
+      } else {
+        nextNumber = (existing.first['next_number'] as num).toInt();
+        final now = utcNow();
+        await db.execute(
+          'UPDATE bill_number_sequence SET next_number = ?, updated_at = ? WHERE shop_id = ?',
+          [nextNumber + 1, now, shopId],
+        );
+      }
+
+      final billNumber = 'BILL-${nextNumber.toString().padLeft(6, '0')}';
+      return shelf.Response.ok(jsonEncode({'billNumber': billNumber, 'shopId': shopId}));
+    } catch (e) {
+      return shelf.Response(500, body: jsonEncode({'error': 'Error generating bill number: $e'}));
+    }
   }
 }
 
