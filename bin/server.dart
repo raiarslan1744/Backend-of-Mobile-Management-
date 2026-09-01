@@ -40,11 +40,18 @@ List<String> getShopCleanupTableOrder() => const [
   'debtors',
   'debt_transactions',
   'accessories',
+  'mobile_units',
+  'mobile_models',
   'mobile_devices',
+  'suppliers',
   'purchases',
+  'returns',
+  'bill_number_sequence',
   'devices',
   'sessions',
   'users',
+  'shop_settings',
+  'backup_settings',
   'shops',
 ];
 
