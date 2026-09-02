@@ -609,7 +609,6 @@ class ServerApp {
     router.get('/api/health', _health);
     router.get('/api/super-admin/shops', _listShops);
     router.post('/api/super-admin/shops', _createShop);
-    router.delete('/api/super-admin/shops', _deleteShop);
     router.delete('/api/super-admin/shops/<shopId>', _deleteShop);
     router.post('/api/shops', _createShop);
     router.post('/api/auth/login', _login);
@@ -679,28 +678,27 @@ class ServerApp {
   }
 
   Future<shelf.Response> _deleteShop(shelf.Request request) async {
-    final requestedShopId =
-        request.params['shopId'] ??
-        (await _body(request))['shopId']?.toString() ??
-        '';
-    final shopId = requestedShopId.trim();
-    print('DELETE BUTTON CLICKED shopId=$shopId');
+    final shopId = request.params['shopId']?.trim() ?? '';
+    final startedAt = DateTime.now().toUtc();
+    print('DELETE START shopId=$shopId requestStarted=$startedAt');
 
     final auth = await _requireAuth(request);
     if (auth == null) {
-      print(
-        'CONFIRMATION ACCEPTED shopId=$shopId result=unauthorized status=401',
+      print('DELETE FAILURE shopId=$shopId status=401 category=unauthorized');
+      return shelf.Response(
+        401,
+        body: jsonEncode({'error': 'Unauthorized'}),
       );
-      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
     }
     if (auth['user']['role'] != 'super_admin') {
-      print('CONFIRMATION ACCEPTED shopId=$shopId result=forbidden status=403');
+      print('DELETE FAILURE shopId=$shopId status=403 category=forbidden');
       return shelf.Response(
         403,
         body: jsonEncode({'error': 'Super admin authorization required'}),
       );
     }
     if (shopId.isEmpty || shopId == 'SUPER_ADMIN') {
+      print('DELETE FAILURE shopId=$shopId status=400 category=invalid_shop_id');
       return shelf.Response(
         400,
         body: jsonEncode({'error': 'A valid shopId is required'}),
@@ -708,15 +706,12 @@ class ServerApp {
     }
 
     try {
-      print(
-        'CLOUD DELETE STARTED shopId=$shopId route=/api/super-admin/shops/$shopId',
-      );
       final shopRows = await db.select(
         'SELECT shop_id FROM shops WHERE shop_id = ?',
         [shopId],
       );
       if (shopRows.isEmpty) {
-        print('DELETE FINAL RESULT shopId=$shopId success=false status=404');
+        print('DELETE FAILURE shopId=$shopId status=404 category=not_found');
         return shelf.Response(
           404,
           body: jsonEncode({'error': 'Shop not found', 'shopId': shopId}),
@@ -746,38 +741,8 @@ class ServerApp {
           print('DATABASE CLEANUP STARTED shopId=$shopId table=sessions');
         }
 
-        const deletionOrder = [
-          'sync_records',
-          'mobile_units',
-          'sales',
-          'returns',
-          'mobile_devices',
-          'accessories',
-          'purchases',
-          'suppliers',
-          'mobile_models',
-          'products',
-          'customers',
-          'employees',
-          'repairs',
-          'debt_transactions',
-          'debtors',
-          'bill_number_sequence',
-          'devices',
-          'users',
-          'shops',
-        ];
-        final deletedTables = deletionOrder.toSet();
-        for (final tableName in deletionOrder) {
-          if (shopScopedTables.contains(tableName)) {
-            await db.execute('DELETE FROM "$tableName" WHERE shop_id = ?', [
-              shopId,
-            ]);
-            print('DATABASE CLEANUP COMPLETED shopId=$shopId table=$tableName');
-          }
-        }
-        for (final tableName in shopScopedTables) {
-          if (deletedTables.contains(tableName)) continue;
+        for (final tableName in _shopScopedDeletionOrder(shopScopedTables)) {
+          if (tableName == 'shops') continue;
           await db.execute('DELETE FROM "$tableName" WHERE shop_id = ?', [
             shopId,
           ]);
@@ -793,7 +758,8 @@ class ServerApp {
         rethrow;
       }
 
-      print('HTTP RESPONSE SENT shopId=$shopId status=200');
+      final elapsedMs = DateTime.now().difference(startedAt).inMilliseconds;
+      print('DELETE SUCCESS shopId=$shopId status=200 elapsedMs=$elapsedMs');
       return shelf.Response.ok(
         jsonEncode({
           'success': true,
@@ -802,8 +768,9 @@ class ServerApp {
         }),
       );
     } catch (error, stackTrace) {
+      final elapsedMs = DateTime.now().difference(startedAt).inMilliseconds;
       print(
-        'DELETE FINAL RESULT shopId=$shopId success=false type=${error.runtimeType} message=$error stackTrace=$stackTrace',
+        'DELETE FAILURE shopId=$shopId status=500 category=server_error elapsedMs=$elapsedMs type=${error.runtimeType} message=$error stackTrace=$stackTrace',
       );
       return shelf.Response(
         500,
@@ -814,13 +781,41 @@ class ServerApp {
 
   Future<Set<String>> _shopScopedTables() async {
     final rows = await db.select(
-      "SELECT DISTINCT table_name FROM information_schema.tables t JOIN information_schema.columns c USING (table_schema, table_name) WHERE t.table_schema = ? AND t.table_type = 'BASE TABLE' AND c.column_name = ?",
+      "SELECT DISTINCT table_name FROM information_schema.columns WHERE table_schema = ? AND column_name = ? AND table_name NOT IN ('super_admin') ORDER BY table_name",
       ['public', 'shop_id'],
     );
     return rows
         .map((row) => row['table_name']?.toString())
         .whereType<String>()
         .toSet();
+  }
+
+  List<String> _shopScopedDeletionOrder(Set<String> tables) {
+    const preferredOrder = [
+      'sync_records',
+      'mobile_units',
+      'mobile_devices',
+      'sales',
+      'returns',
+      'purchases',
+      'accessories',
+      'products',
+      'customers',
+      'repairs',
+      'debt_transactions',
+      'debtors',
+      'employees',
+      'devices',
+      'users',
+      'shops',
+    ];
+    final ordered = <String>[];
+    for (final tableName in preferredOrder) {
+      if (tables.contains(tableName)) ordered.add(tableName);
+    }
+    final remaining = tables.difference(ordered.toSet()).toList()..sort();
+    ordered.addAll(remaining);
+    return ordered;
   }
 
   Future<shelf.Response> _createShop(shelf.Request request) async {
