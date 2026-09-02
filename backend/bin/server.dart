@@ -56,31 +56,6 @@ SuperAdminUserAction resolveSuperAdminUserAction(
   );
 }
 
-List<String> getShopCleanupTableOrder() => const [
-  'sync_records',
-  'products',
-  'sales',
-  'customers',
-  'employees',
-  'repairs',
-  'debtors',
-  'debt_transactions',
-  'accessories',
-  'mobile_units',
-  'mobile_models',
-  'mobile_devices',
-  'suppliers',
-  'purchases',
-  'returns',
-  'bill_number_sequence',
-  'devices',
-  'sessions',
-  'users',
-  'shop_settings',
-  'backup_settings',
-  'shops',
-];
-
 String? authTokenFromRequest(shelf.Request request) {
   final authHeader = request.headers['authorization'];
   if (authHeader == null || !authHeader.startsWith('Bearer ')) {
@@ -678,18 +653,20 @@ class ServerApp {
   }
 
   Future<shelf.Response> _deleteShop(shelf.Request request) async {
+    final deleteStartedAt = DateTime.now();
+    print('DELETE REQUEST RECEIVED elapsedMs=0');
     final shopId = request.params['shopId']?.trim() ?? '';
-    final startedAt = DateTime.now().toUtc();
-    print('DELETE START shopId=$shopId requestStarted=$startedAt');
+    print('DELETE START shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
 
     final auth = await _requireAuth(request);
     if (auth == null) {
-      print('DELETE FAILURE shopId=$shopId status=401 category=unauthorized');
+      print('DELETE AUTH FAILED shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
       return shelf.Response(
         401,
         body: jsonEncode({'error': 'Unauthorized'}),
       );
     }
+    print('DELETE AUTH VERIFIED shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
     if (auth['user']['role'] != 'super_admin') {
       print('DELETE FAILURE shopId=$shopId status=403 category=forbidden');
       return shelf.Response(
@@ -710,6 +687,7 @@ class ServerApp {
         'SELECT shop_id FROM shops WHERE shop_id = ?',
         [shopId],
       );
+      print('DELETE SHOP LOOKUP COMPLETE shopId=$shopId rows=${shopRows.length} elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
       if (shopRows.isEmpty) {
         print('DELETE FAILURE shopId=$shopId status=404 category=not_found');
         return shelf.Response(
@@ -727,7 +705,7 @@ class ServerApp {
           .whereType<String>()
           .toList(growable: false);
 
-      final shopScopedTables = await _shopScopedTables();
+      print('DELETE STARTING TRANSACTION shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
       await db.execute('BEGIN');
       try {
         await db.execute("SET LOCAL lock_timeout = '5s'");
@@ -741,15 +719,33 @@ class ServerApp {
           print('DATABASE CLEANUP STARTED shopId=$shopId table=sessions');
         }
 
-        for (final tableName in _shopScopedDeletionOrder(shopScopedTables)) {
-          if (tableName == 'shops') continue;
+        const shopScopedTables = [
+          'sync_records',
+          'mobile_units',
+          'mobile_devices',
+          'sales',
+          'returns',
+          'purchases',
+          'accessories',
+          'products',
+          'customers',
+          'repairs',
+          'debt_transactions',
+          'debtors',
+          'employees',
+          'devices',
+          'users',
+        ];
+        for (final tableName in shopScopedTables) {
+          final tableStartedAt = DateTime.now();
+          print('DELETING TABLE: $tableName elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
           await db.execute('DELETE FROM "$tableName" WHERE shop_id = ?', [
             shopId,
           ]);
-          print('DATABASE CLEANUP COMPLETED shopId=$shopId table=$tableName');
+          print('DELETE TABLE COMPLETE table=$tableName stepMs=${DateTime.now().difference(tableStartedAt).inMilliseconds} totalMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
         }
         await db.execute('COMMIT');
-        print('TRANSACTION COMMITTED shopId=$shopId');
+        print('COMMIT COMPLETE shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
       } catch (error, stackTrace) {
         await db.execute('ROLLBACK');
         print(
@@ -758,8 +754,8 @@ class ServerApp {
         rethrow;
       }
 
-      final elapsedMs = DateTime.now().difference(startedAt).inMilliseconds;
-      print('DELETE SUCCESS shopId=$shopId status=200 elapsedMs=$elapsedMs');
+      final elapsedMs = DateTime.now().difference(deleteStartedAt).inMilliseconds;
+      print('DELETE RESPONSE SENT shopId=$shopId status=200 elapsedMs=$elapsedMs');
       return shelf.Response.ok(
         jsonEncode({
           'success': true,
@@ -768,7 +764,7 @@ class ServerApp {
         }),
       );
     } catch (error, stackTrace) {
-      final elapsedMs = DateTime.now().difference(startedAt).inMilliseconds;
+      final elapsedMs = DateTime.now().difference(deleteStartedAt).inMilliseconds;
       print(
         'DELETE FAILURE shopId=$shopId status=500 category=server_error elapsedMs=$elapsedMs type=${error.runtimeType} message=$error stackTrace=$stackTrace',
       );
@@ -777,45 +773,6 @@ class ServerApp {
         body: jsonEncode({'error': 'Failed to delete shop'}),
       );
     }
-  }
-
-  Future<Set<String>> _shopScopedTables() async {
-    final rows = await db.select(
-      "SELECT DISTINCT table_name FROM information_schema.columns WHERE table_schema = ? AND column_name = ? AND table_name NOT IN ('super_admin') ORDER BY table_name",
-      ['public', 'shop_id'],
-    );
-    return rows
-        .map((row) => row['table_name']?.toString())
-        .whereType<String>()
-        .toSet();
-  }
-
-  List<String> _shopScopedDeletionOrder(Set<String> tables) {
-    const preferredOrder = [
-      'sync_records',
-      'mobile_units',
-      'mobile_devices',
-      'sales',
-      'returns',
-      'purchases',
-      'accessories',
-      'products',
-      'customers',
-      'repairs',
-      'debt_transactions',
-      'debtors',
-      'employees',
-      'devices',
-      'users',
-      'shops',
-    ];
-    final ordered = <String>[];
-    for (final tableName in preferredOrder) {
-      if (tables.contains(tableName)) ordered.add(tableName);
-    }
-    final remaining = tables.difference(ordered.toSet()).toList()..sort();
-    ordered.addAll(remaining);
-    return ordered;
   }
 
   Future<shelf.Response> _createShop(shelf.Request request) async {
@@ -959,21 +916,25 @@ class ServerApp {
       );
     }
 
-    final superAdminRows = await db.select(
+    final superAdminRows = await _timedSelect(
+      'LOGIN QUERY super_admin',
       'SELECT * FROM users WHERE username = ? AND role = ? AND password_hash = ?',
       [username, 'super_admin', hashPassword(password)],
     );
-    final shopAdminRows = await db.select(
+    final shopAdminRows = await _timedSelect(
+      'LOGIN QUERY shop_admin',
       'SELECT * FROM users WHERE username = ? AND shop_id = ? AND password_hash = ? AND role = ?',
       [username, suppliedShopId, hashPassword(password), 'admin'],
     );
     final shopCredentialRows = shopAdminRows.isEmpty
-        ? await db.select(
+        ? await _timedSelect(
+            'LOGIN QUERY shop_credentials',
             'SELECT * FROM shops WHERE username = ? AND shop_id = ? AND password_hash = ?',
             [username, suppliedShopId, hashPassword(password)],
           )
         : const <Map<String, Object?>>[];
-    final employeeRows = await db.select(
+    final employeeRows = await _timedSelect(
+      'LOGIN QUERY employee',
       'SELECT * FROM employees WHERE username = ? AND shop_id = ? AND password_hash = ?',
       [username, suppliedShopId, hashPassword(password)],
     );
@@ -1037,6 +998,7 @@ class ServerApp {
         .toUtc()
         .add(const Duration(hours: 24))
         .toIso8601String();
+    final sessionWriteStartedAt = DateTime.now();
     await db.execute(
       'INSERT INTO sessions (id, user_id, token, device_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
       [
@@ -1048,6 +1010,7 @@ class ServerApp {
         now,
       ],
     );
+    print('LOGIN WRITE sessions stepMs=${DateTime.now().difference(sessionWriteStartedAt).inMilliseconds} totalMs=${stopwatch.elapsedMilliseconds}');
 
     final sessionPayload = {
       'userId': user['id'],
@@ -1388,7 +1351,8 @@ class ServerApp {
   Future<Map<String, dynamic>?> _requireAuth(shelf.Request request) async {
     final token = authTokenFromRequest(request);
     if (token == null) return null;
-    final rows = await db.select(
+    final rows = await _timedSelect(
+      'AUTH QUERY session',
       'SELECT s.*, u.username, u.shop_id, u.role, u.password_hash FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?',
       [token],
     );
@@ -1400,6 +1364,27 @@ class ServerApp {
       return null;
     }
     return {'token': token, 'user': session};
+  }
+
+  Future<List<Map<String, Object?>>> _timedSelect(
+    String label,
+    String sql,
+    List<Object?> parameters,
+  ) async {
+    final startedAt = DateTime.now();
+    print('$label START totalMs=0');
+    try {
+      final rows = await db.select(sql, parameters);
+      print(
+        '$label COMPLETE rows=${rows.length} stepMs=${DateTime.now().difference(startedAt).inMilliseconds}',
+      );
+      return rows;
+    } catch (error) {
+      print(
+        '$label FAILED error=$error stepMs=${DateTime.now().difference(startedAt).inMilliseconds}',
+      );
+      rethrow;
+    }
   }
 
   Future<Map<String, dynamic>> _body(shelf.Request request) async {
