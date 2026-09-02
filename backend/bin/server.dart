@@ -56,6 +56,29 @@ SuperAdminUserAction resolveSuperAdminUserAction(
   );
 }
 
+List<String> getShopCleanupTableOrder() => const [
+  'sync_records',
+  'products',
+  'sales',
+  'customers',
+  'employees',
+  'repairs',
+  'debtors',
+  'debt_transactions',
+  'accessories',
+  'mobile_units',
+  'mobile_models',
+  'mobile_devices',
+  'suppliers',
+  'purchases',
+  'returns',
+  'bill_number_sequence',
+  'devices',
+  'sessions',
+  'users',
+  'shops',
+];
+
 String? authTokenFromRequest(shelf.Request request) {
   final authHeader = request.headers['authorization'];
   if (authHeader == null || !authHeader.startsWith('Bearer ')) {
@@ -696,54 +719,44 @@ class ServerApp {
         );
       }
 
-      final userRows = await db.select(
-        'SELECT id FROM users WHERE shop_id = ?',
-        [shopId],
-      );
-      final userIds = userRows
-          .map((row) => row['id'])
-          .whereType<String>()
-          .toList(growable: false);
-
       print('DELETE STARTING TRANSACTION shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
       await db.execute('BEGIN');
       try {
         await db.execute("SET LOCAL lock_timeout = '5s'");
         await db.execute("SET LOCAL statement_timeout = '12s'");
-        if (userIds.isNotEmpty) {
-          final placeholders = List.filled(userIds.length, '?').join(', ');
-          await db.execute(
-            'DELETE FROM sessions WHERE user_id IN ($placeholders)',
-            userIds,
-          );
-          print('DATABASE CLEANUP STARTED shopId=$shopId table=sessions');
-        }
 
-        const shopScopedTables = [
-          'sync_records',
-          'mobile_units',
-          'mobile_devices',
-          'sales',
-          'returns',
-          'purchases',
-          'accessories',
-          'products',
-          'customers',
-          'repairs',
-          'debt_transactions',
-          'debtors',
-          'employees',
-          'devices',
-          'users',
-        ];
-        for (final tableName in shopScopedTables) {
-          final tableStartedAt = DateTime.now();
-          print('DELETING TABLE: $tableName elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
-          await db.execute('DELETE FROM "$tableName" WHERE shop_id = ?', [
-            shopId,
-          ]);
-          print('DELETE TABLE COMPLETE table=$tableName stepMs=${DateTime.now().difference(tableStartedAt).inMilliseconds} totalMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
-        }
+        final escapedShopId = shopId.replaceAll("'", "''");
+        print('DELETE BATCH STARTED shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
+        await db.execute('''
+          DO \$delete_shop\$
+          DECLARE
+            target_shop_id TEXT := '$escapedShopId';
+          BEGIN
+            -- Delete in dependency order; sessions are owned through users.user_id.
+            DELETE FROM sync_records WHERE shop_id = target_shop_id;
+            DELETE FROM mobile_units WHERE shop_id = target_shop_id;
+            DELETE FROM mobile_devices WHERE shop_id = target_shop_id;
+            DELETE FROM sales WHERE shop_id = target_shop_id;
+            DELETE FROM returns WHERE shop_id = target_shop_id;
+            DELETE FROM purchases WHERE shop_id = target_shop_id;
+            DELETE FROM accessories WHERE shop_id = target_shop_id;
+            DELETE FROM products WHERE shop_id = target_shop_id;
+            DELETE FROM customers WHERE shop_id = target_shop_id;
+            DELETE FROM repairs WHERE shop_id = target_shop_id;
+            DELETE FROM debt_transactions WHERE shop_id = target_shop_id;
+            DELETE FROM debtors WHERE shop_id = target_shop_id;
+            DELETE FROM employees WHERE shop_id = target_shop_id;
+            DELETE FROM devices WHERE shop_id = target_shop_id;
+            DELETE FROM sessions
+              WHERE user_id IN (
+                SELECT id FROM users WHERE shop_id = target_shop_id
+              );
+            DELETE FROM users WHERE shop_id = target_shop_id;
+            DELETE FROM shops WHERE shop_id = target_shop_id;
+          END
+          \$delete_shop\$;
+        ''');
+        print('DELETE BATCH COMPLETE shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
         await db.execute('COMMIT');
         print('COMMIT COMPLETE shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
       } catch (error, stackTrace) {
