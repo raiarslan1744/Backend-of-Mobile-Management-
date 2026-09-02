@@ -731,28 +731,101 @@ class ServerApp {
           DO \$delete_shop\$
           DECLARE
             target_shop_id TEXT := '$escapedShopId';
+            batch_started_at TIMESTAMPTZ := clock_timestamp();
+            section_started_at TIMESTAMPTZ;
+            deleted_count BIGINT;
           BEGIN
-            -- Delete in dependency order; sessions are owned through users.user_id.
+            RAISE NOTICE 'SHOP DELETE START shopId=%', target_shop_id;
+
+            section_started_at := clock_timestamp();
             DELETE FROM sync_records WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=sync_records rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM mobile_units WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=mobile_units rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM mobile_devices WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=mobile_devices rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM sales WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=sales rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM returns WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=returns rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM purchases WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=purchases rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM accessories WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=accessories rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM products WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=products rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM customers WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=customers rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM repairs WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=repairs rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM debt_transactions WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=debt_transactions rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM debtors WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=debtors rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM employees WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=employees rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM devices WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=devices rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM sessions
               WHERE user_id IN (
                 SELECT id FROM users WHERE shop_id = target_shop_id
               );
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=sessions/users rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM users WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=users rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            section_started_at := clock_timestamp();
             DELETE FROM shops WHERE shop_id = target_shop_id;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'SHOP DELETE section=shops rows=% elapsed_ms=%', deleted_count, EXTRACT(EPOCH FROM (clock_timestamp() - section_started_at)) * 1000;
+
+            RAISE NOTICE 'SHOP DELETE END shopId=% total_elapsed_ms=%', target_shop_id, EXTRACT(EPOCH FROM (clock_timestamp() - batch_started_at)) * 1000;
           END
           \$delete_shop\$;
         ''');
@@ -1040,7 +1113,7 @@ class ServerApp {
         'INSERT INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, device_id) DO UPDATE SET user_id = EXCLUDED.user_id, imei = EXCLUDED.imei, device_name = EXCLUDED.device_name, device_type = EXCLUDED.device_type, last_seen_at = EXCLUDED.last_seen_at',
         [
           const Uuid().v4(),
-          user['id'] as String,
+          user['id'].toString(),
           shopId,
           deviceId,
           deviceId,
@@ -1081,7 +1154,7 @@ class ServerApp {
     }
     final shopId = request.url.queryParameters['shopId'] ?? '';
     final user = auth['user'];
-    final hasAccess = user['shop_id'] == shopId || user['role'] == 'admin';
+    final hasAccess = user['shop_id'] == shopId || user['role'] == 'super_admin';
     final payload = {'hasAccess': hasAccess, 'shopId': shopId};
     return hasAccess
         ? shelf.Response.ok(jsonEncode(payload))
@@ -1246,7 +1319,7 @@ class ServerApp {
     final shopId =
         request.url.queryParameters['shopId'] ??
         auth['user']['shop_id'] as String;
-    if (auth['user']['shop_id'] != shopId && auth['user']['role'] != 'admin') {
+    if (auth['user']['shop_id'] != shopId && auth['user']['role'] != 'super_admin') {
       return shelf.Response(
         403,
         body: jsonEncode({'error': 'Shop access denied'}),
