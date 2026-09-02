@@ -9,3 +9,18 @@ coverage/
 .idea/
 .vscode/
 'DON'T' 
+
+# Flutter application outputs and local tooling
+.flutter-plugins-dependencies
+**/build/
+**/.dart_tool/
+windows/flutter/ephemeral/
+*.iml
+
+# Local verification and installer artifacts
+*.log
+*.exe
+*.rar
+*_output.txt
+full_flutter_test_exit.txt
+temp_debug.dart
