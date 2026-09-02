@@ -684,19 +684,17 @@ class ServerApp {
         (await _body(request))['shopId']?.toString() ??
         '';
     final shopId = requestedShopId.trim();
-    print('Shop deletion request received shopId=$shopId');
+    print('DELETE BUTTON CLICKED shopId=$shopId');
 
     final auth = await _requireAuth(request);
     if (auth == null) {
       print(
-        'Shop deletion rejected shopId=$shopId stage=authorization status=401',
+        'CONFIRMATION ACCEPTED shopId=$shopId result=unauthorized status=401',
       );
       return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
     }
     if (auth['user']['role'] != 'super_admin') {
-      print(
-        'Shop deletion rejected shopId=$shopId stage=authorization status=403',
-      );
+      print('CONFIRMATION ACCEPTED shopId=$shopId result=forbidden status=403');
       return shelf.Response(
         403,
         body: jsonEncode({'error': 'Super admin authorization required'}),
@@ -710,14 +708,15 @@ class ServerApp {
     }
 
     try {
+      print(
+        'CLOUD DELETE STARTED shopId=$shopId route=/api/super-admin/shops/$shopId',
+      );
       final shopRows = await db.select(
         'SELECT shop_id FROM shops WHERE shop_id = ?',
         [shopId],
       );
       if (shopRows.isEmpty) {
-        print(
-          'Shop deletion completed shopId=$shopId stage=already_absent status=404',
-        );
+        print('DELETE FINAL RESULT shopId=$shopId success=false status=404');
         return shelf.Response(
           404,
           body: jsonEncode({'error': 'Shop not found', 'shopId': shopId}),
@@ -732,9 +731,7 @@ class ServerApp {
           .map((row) => row['id'])
           .whereType<String>()
           .toList(growable: false);
-      print(
-        'Shop deletion authorized shopId=$shopId stage=transaction_start status=accepted',
-      );
+
       final shopScopedTables = await _shopScopedTables();
       await db.execute('BEGIN');
       try {
@@ -746,7 +743,7 @@ class ServerApp {
             'DELETE FROM sessions WHERE user_id IN ($placeholders)',
             userIds,
           );
-          print('Shop deletion stage=sessions completed shopId=$shopId');
+          print('DATABASE CLEANUP STARTED shopId=$shopId table=sessions');
         }
 
         const deletionOrder = [
@@ -776,32 +773,27 @@ class ServerApp {
             await db.execute('DELETE FROM "$tableName" WHERE shop_id = ?', [
               shopId,
             ]);
-            print('Shop deletion stage=$tableName completed shopId=$shopId');
+            print('DATABASE CLEANUP COMPLETED shopId=$shopId table=$tableName');
           }
         }
         for (final tableName in shopScopedTables) {
-          if (deletedTables.contains(tableName)) {
-            continue;
-          }
+          if (deletedTables.contains(tableName)) continue;
           await db.execute('DELETE FROM "$tableName" WHERE shop_id = ?', [
             shopId,
           ]);
-          print('Shop deletion stage=$tableName completed shopId=$shopId');
+          print('DATABASE CLEANUP COMPLETED shopId=$shopId table=$tableName');
         }
-        print('Shop deletion stage=shop_record completed shopId=$shopId');
         await db.execute('COMMIT');
-        print(
-          'Shop deletion stage=transaction_commit completed shopId=$shopId',
-        );
+        print('TRANSACTION COMMITTED shopId=$shopId');
       } catch (error, stackTrace) {
         await db.execute('ROLLBACK');
         print(
-          'Shop deletion database error shopId=$shopId stage=rollback type=${error.runtimeType} message=$error stackTrace=$stackTrace',
+          'DATABASE CLEANUP FAILED shopId=$shopId type=${error.runtimeType} message=$error stackTrace=$stackTrace',
         );
         rethrow;
       }
 
-      print('Shop deletion completed shopId=$shopId stage=commit status=200');
+      print('HTTP RESPONSE SENT shopId=$shopId status=200');
       return shelf.Response.ok(
         jsonEncode({
           'success': true,
@@ -811,7 +803,7 @@ class ServerApp {
       );
     } catch (error, stackTrace) {
       print(
-        'Shop deletion database error shopId=$shopId stage=failed type=${error.runtimeType} message=$error stackTrace=$stackTrace',
+        'DELETE FINAL RESULT shopId=$shopId success=false type=${error.runtimeType} message=$error stackTrace=$stackTrace',
       );
       return shelf.Response(
         500,
@@ -851,6 +843,7 @@ class ServerApp {
     final username = (body['username'] ?? 'admin').toString();
     final password = (body['password'] ?? 'admin123').toString();
     final passwordHash = body['passwordHash']?.toString();
+    print('CREATE SHOP CLICKED shopId=$shopId username=$username');
     if (shopId.isEmpty) {
       return shelf.Response(
         400,
@@ -870,37 +863,41 @@ class ServerApp {
     }
 
     final now = utcNow();
-    await db.execute(
-      'INSERT INTO shops (shop_id, owner_name, contact, address, username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [
-        shopId,
-        (body['ownerName'] ?? 'Shop Owner').toString(),
-        (body['contact'] ?? '').toString(),
-        (body['address'] ?? '').toString(),
-        username,
-        passwordHash ?? hashPassword(password),
-        now,
-        now,
-      ],
-    );
+    final resolvedHash = passwordHash ?? hashPassword(password);
+    try {
+      await db.execute(
+        'INSERT INTO shops (shop_id, owner_name, contact, address, username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [
+          shopId,
+          (body['ownerName'] ?? 'Shop Owner').toString(),
+          (body['contact'] ?? '').toString(),
+          (body['address'] ?? '').toString(),
+          username,
+          resolvedHash,
+          now,
+          now,
+        ],
+      );
 
-    final userId = const Uuid().v4();
-    await db.execute(
-      'INSERT OR IGNORE INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [
-        userId,
-        username,
-        passwordHash ?? hashPassword(password),
-        shopId,
-        'admin',
-        now,
-        now,
-      ],
-    );
+      final userId = const Uuid().v4();
+      await db.execute(
+        'INSERT OR IGNORE INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [userId, username, resolvedHash, shopId, 'admin', now, now],
+      );
 
-    return shelf.Response.ok(
-      jsonEncode({'success': true, 'shopId': shopId, 'username': username}),
-    );
+      print('CREATE SHOP FINAL RESULT shopId=$shopId success=true');
+      return shelf.Response.ok(
+        jsonEncode({'success': true, 'shopId': shopId, 'username': username}),
+      );
+    } catch (error, stackTrace) {
+      print(
+        'CREATE SHOP FINAL RESULT shopId=$shopId success=false type=${error.runtimeType} message=$error stackTrace=$stackTrace',
+      );
+      return shelf.Response(
+        500,
+        body: jsonEncode({'error': 'Failed to create shop'}),
+      );
+    }
   }
 
   Future<shelf.Response> _listShops(shelf.Request request) async {
