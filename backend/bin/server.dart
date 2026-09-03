@@ -522,9 +522,15 @@ class ServerApp {
         supplier_id BIGINT,
         status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'sold', 'returned')),
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        is_deleted INTEGER NOT NULL DEFAULT 0
       )
     ''');
+    await _ensureColumn(
+      'mobile_units',
+      'is_deleted',
+      'INTEGER NOT NULL DEFAULT 0',
+    );
 
     await db.execute('''
       CREATE TABLE IF NOT EXISTS suppliers (
@@ -679,17 +685,20 @@ class ServerApp {
     final deleteStartedAt = DateTime.now();
     print('DELETE REQUEST RECEIVED elapsedMs=0');
     final shopId = request.params['shopId']?.trim() ?? '';
-    print('DELETE START shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
+    print(
+      'DELETE START shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}',
+    );
 
     final auth = await _requireAuth(request);
     if (auth == null) {
-      print('DELETE AUTH FAILED shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
-      return shelf.Response(
-        401,
-        body: jsonEncode({'error': 'Unauthorized'}),
+      print(
+        'DELETE AUTH FAILED shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}',
       );
+      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
     }
-    print('DELETE AUTH VERIFIED shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
+    print(
+      'DELETE AUTH VERIFIED shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}',
+    );
     if (auth['user']['role'] != 'super_admin') {
       print('DELETE FAILURE shopId=$shopId status=403 category=forbidden');
       return shelf.Response(
@@ -698,7 +707,9 @@ class ServerApp {
       );
     }
     if (shopId.isEmpty || shopId == 'SUPER_ADMIN') {
-      print('DELETE FAILURE shopId=$shopId status=400 category=invalid_shop_id');
+      print(
+        'DELETE FAILURE shopId=$shopId status=400 category=invalid_shop_id',
+      );
       return shelf.Response(
         400,
         body: jsonEncode({'error': 'A valid shopId is required'}),
@@ -710,7 +721,9 @@ class ServerApp {
         'SELECT shop_id FROM shops WHERE shop_id = ?',
         [shopId],
       );
-      print('DELETE SHOP LOOKUP COMPLETE shopId=$shopId rows=${shopRows.length} elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
+      print(
+        'DELETE SHOP LOOKUP COMPLETE shopId=$shopId rows=${shopRows.length} elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}',
+      );
       if (shopRows.isEmpty) {
         print('DELETE FAILURE shopId=$shopId status=404 category=not_found');
         return shelf.Response(
@@ -719,14 +732,18 @@ class ServerApp {
         );
       }
 
-      print('DELETE STARTING TRANSACTION shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
+      print(
+        'DELETE STARTING TRANSACTION shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}',
+      );
       await db.execute('BEGIN');
       try {
         await db.execute("SET LOCAL lock_timeout = '5s'");
         await db.execute("SET LOCAL statement_timeout = '12s'");
 
         final escapedShopId = shopId.replaceAll("'", "''");
-        print('DELETE BATCH STARTED shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
+        print(
+          'DELETE BATCH STARTED shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}',
+        );
         await db.execute('''
           DO \$delete_shop\$
           DECLARE
@@ -829,9 +846,13 @@ class ServerApp {
           END
           \$delete_shop\$;
         ''');
-        print('DELETE BATCH COMPLETE shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
+        print(
+          'DELETE BATCH COMPLETE shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}',
+        );
         await db.execute('COMMIT');
-        print('COMMIT COMPLETE shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}');
+        print(
+          'COMMIT COMPLETE shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}',
+        );
       } catch (error, stackTrace) {
         await db.execute('ROLLBACK');
         print(
@@ -840,8 +861,12 @@ class ServerApp {
         rethrow;
       }
 
-      final elapsedMs = DateTime.now().difference(deleteStartedAt).inMilliseconds;
-      print('DELETE RESPONSE SENT shopId=$shopId status=200 elapsedMs=$elapsedMs');
+      final elapsedMs = DateTime.now()
+          .difference(deleteStartedAt)
+          .inMilliseconds;
+      print(
+        'DELETE RESPONSE SENT shopId=$shopId status=200 elapsedMs=$elapsedMs',
+      );
       return shelf.Response.ok(
         jsonEncode({
           'success': true,
@@ -850,7 +875,9 @@ class ServerApp {
         }),
       );
     } catch (error, stackTrace) {
-      final elapsedMs = DateTime.now().difference(deleteStartedAt).inMilliseconds;
+      final elapsedMs = DateTime.now()
+          .difference(deleteStartedAt)
+          .inMilliseconds;
       print(
         'DELETE FAILURE shopId=$shopId status=500 category=server_error elapsedMs=$elapsedMs type=${error.runtimeType} message=$error stackTrace=$stackTrace',
       );
@@ -1096,7 +1123,9 @@ class ServerApp {
         now,
       ],
     );
-    print('LOGIN WRITE sessions stepMs=${DateTime.now().difference(sessionWriteStartedAt).inMilliseconds} totalMs=${stopwatch.elapsedMilliseconds}');
+    print(
+      'LOGIN WRITE sessions stepMs=${DateTime.now().difference(sessionWriteStartedAt).inMilliseconds} totalMs=${stopwatch.elapsedMilliseconds}',
+    );
 
     final sessionPayload = {
       'userId': user['id'],
@@ -1154,7 +1183,8 @@ class ServerApp {
     }
     final shopId = request.url.queryParameters['shopId'] ?? '';
     final user = auth['user'];
-    final hasAccess = user['shop_id'] == shopId || user['role'] == 'super_admin';
+    final hasAccess =
+        user['shop_id'] == shopId || user['role'] == 'super_admin';
     final payload = {'hasAccess': hasAccess, 'shopId': shopId};
     return hasAccess
         ? shelf.Response.ok(jsonEncode(payload))
@@ -1319,7 +1349,8 @@ class ServerApp {
     final shopId =
         request.url.queryParameters['shopId'] ??
         auth['user']['shop_id'] as String;
-    if (auth['user']['shop_id'] != shopId && auth['user']['role'] != 'super_admin') {
+    if (auth['user']['shop_id'] != shopId &&
+        auth['user']['role'] != 'super_admin') {
       return shelf.Response(
         403,
         body: jsonEncode({'error': 'Shop access denied'}),
@@ -1721,7 +1752,8 @@ class ServerApp {
     final shopId = auth['user']['shop_id'] as String;
     final modelId = request.url.queryParameters['modelId'];
 
-    String sql = 'SELECT * FROM mobile_units WHERE shop_id = ?';
+    String sql =
+        'SELECT * FROM mobile_units WHERE shop_id = ? AND is_deleted = 0';
     final params = <Object?>[shopId];
 
     if (modelId != null) {
