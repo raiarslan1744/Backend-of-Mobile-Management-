@@ -278,7 +278,10 @@ class ServerApp {
         password_hash TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'active',
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        license_start_date TEXT,
+        license_expiry_date TEXT,
+        is_lifetime BOOLEAN NOT NULL DEFAULT FALSE
       )
     ''');
 
@@ -514,7 +517,7 @@ class ServerApp {
         id BIGSERIAL PRIMARY KEY,
         shop_id TEXT NOT NULL,
         mobile_model_id BIGINT NOT NULL,
-        imei_1 TEXT NOT NULL UNIQUE,
+        imei_1 TEXT NOT NULL,
         imei_2 TEXT,
         buy_price REAL NOT NULL DEFAULT 0,
         ram TEXT,
@@ -530,6 +533,21 @@ class ServerApp {
       'mobile_units',
       'is_deleted',
       'INTEGER NOT NULL DEFAULT 0',
+    );
+    await db.execute(
+      'ALTER TABLE mobile_units DROP CONSTRAINT IF EXISTS mobile_units_imei_1_key',
+    );
+    await db.execute(
+      'CREATE UNIQUE INDEX IF NOT EXISTS mobile_units_active_imei1 ON mobile_units(shop_id, imei_1) WHERE is_deleted = 0',
+    );
+    await db.execute(
+      'CREATE UNIQUE INDEX IF NOT EXISTS mobile_units_active_imei2 ON mobile_units(shop_id, imei_2) WHERE is_deleted = 0 AND imei_2 IS NOT NULL',
+    );
+    await db.execute(
+      'CREATE UNIQUE INDEX IF NOT EXISTS mobile_devices_active_imei1 ON mobile_devices(shop_id, imei1) WHERE is_deleted = 0 AND imei1 IS NOT NULL',
+    );
+    await db.execute(
+      'CREATE UNIQUE INDEX IF NOT EXISTS mobile_devices_active_imei2 ON mobile_devices(shop_id, imei2) WHERE is_deleted = 0 AND imei2 IS NOT NULL',
     );
 
     await db.execute('''
@@ -580,6 +598,14 @@ class ServerApp {
       "TEXT NOT NULL DEFAULT ''",
     );
     await _ensureColumn('shops', 'status', "TEXT NOT NULL DEFAULT 'active'");
+    await _ensureColumn('shops', 'license_start_date', 'TEXT');
+    await _ensureColumn('shops', 'license_expiry_date', 'TEXT');
+    await _ensureColumn('shops', 'license_assigned', 'BOOLEAN');
+    await _ensureColumn(
+      'shops',
+      'is_lifetime',
+      'BOOLEAN NOT NULL DEFAULT FALSE',
+    );
   }
 
   Future<bool> _tableExists(String tableName) async {
@@ -613,6 +639,7 @@ class ServerApp {
     router.get('/api/health', _health);
     router.get('/api/super-admin/shops', _listShops);
     router.post('/api/super-admin/shops', _createShop);
+    router.post('/api/super-admin/shops/<shopId>/license', _renewShopLicense);
     router.delete('/api/super-admin/shops/<shopId>', _deleteShop);
     router.post('/api/shops', _createShop);
     router.post('/api/auth/login', _login);
@@ -929,9 +956,23 @@ class ServerApp {
 
     final now = utcNow();
     final resolvedHash = passwordHash ?? hashPassword(password);
+    final licenseStartDate = body['licenseStartDate']?.toString() ?? now;
+    final isLifetime = body['isLifetime'] == true;
+    final licenseExpiryDate = isLifetime
+        ? null
+        : body['licenseExpiryDate']?.toString();
+    if (body['licenseAssigned'] != true ||
+        (!isLifetime &&
+            (licenseExpiryDate == null ||
+                DateTime.tryParse(licenseExpiryDate) == null))) {
+      return shelf.Response(
+        400,
+        body: jsonEncode({'error': 'A valid assigned license is required'}),
+      );
+    }
     try {
       await db.execute(
-        'INSERT INTO shops (shop_id, owner_name, contact, address, username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO shops (shop_id, owner_name, contact, address, username, password_hash, status, license_start_date, license_expiry_date, is_lifetime, license_assigned, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [
           shopId,
           (body['ownerName'] ?? 'Shop Owner').toString(),
@@ -939,6 +980,11 @@ class ServerApp {
           (body['address'] ?? '').toString(),
           username,
           resolvedHash,
+          body['status']?.toString() == 'suspended' ? 'suspended' : 'active',
+          licenseStartDate,
+          licenseExpiryDate,
+          isLifetime,
+          body['licenseAssigned'] == true ? true : null,
           now,
           now,
         ],
@@ -952,7 +998,16 @@ class ServerApp {
 
       print('CREATE SHOP FINAL RESULT shopId=$shopId success=true');
       return shelf.Response.ok(
-        jsonEncode({'success': true, 'shopId': shopId, 'username': username}),
+        jsonEncode({
+          'success': true,
+          'shopId': shopId,
+          'username': username,
+          'status': 'active',
+          'licenseStartDate': licenseStartDate,
+          'licenseExpiryDate': licenseExpiryDate,
+          'isLifetime': isLifetime,
+          'licenseAssigned': true,
+        }),
       );
     } catch (error, stackTrace) {
       print(
@@ -979,6 +1034,21 @@ class ServerApp {
     final rows = await db.select(
       'SELECT * FROM shops ORDER BY created_at DESC',
     );
+    for (final row in rows) {
+      final lifetime = row['is_lifetime'] == true || row['is_lifetime'] == 1;
+      final expiry = DateTime.tryParse(
+        row['license_expiry_date']?.toString() ?? '',
+      );
+      if (!lifetime &&
+          expiry != null &&
+          DateTime.now().toUtc().isAfter(expiry)) {
+        row['status'] = 'suspended';
+        await db.execute(
+          'UPDATE shops SET status = ?, updated_at = ? WHERE shop_id = ?',
+          ['suspended', utcNow(), row['shop_id']],
+        );
+      }
+    }
     return shelf.Response.ok(
       jsonEncode(
         rows
@@ -991,11 +1061,56 @@ class ServerApp {
                 'username': row['username'],
                 'createdAt': row['created_at'],
                 'updatedAt': row['updated_at'],
+                'status': row['status'],
+                'licenseStartDate': row['license_start_date'],
+                'licenseExpiryDate': row['license_expiry_date'],
+                'isLifetime':
+                    row['is_lifetime'] == true || row['is_lifetime'] == 1,
+                'licenseAssigned': row['license_assigned'] == true || row['license_assigned'] == 1,
               },
             )
             .toList(),
       ),
     );
+  }
+
+  Future<shelf.Response> _renewShopLicense(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null || auth['user']['role'] != 'super_admin') {
+      return shelf.Response(
+        403,
+        body: jsonEncode({'error': 'Super admin authorization required'}),
+      );
+    }
+    final shopId = request.params['shopId']?.trim() ?? '';
+    final body = await _body(request);
+    final isLifetime = body['isLifetime'] == true;
+    final expiry = isLifetime ? null : body['licenseExpiryDate']?.toString();
+    if (!isLifetime && (expiry == null || DateTime.tryParse(expiry) == null)) {
+      return shelf.Response(
+        400,
+        body: jsonEncode({'error': 'A valid license expiry date is required'}),
+      );
+    }
+    final rows = await db.select(
+      'SELECT shop_id FROM shops WHERE shop_id = ?',
+      [shopId],
+    );
+    if (rows.isEmpty) {
+      return shelf.Response(404, body: jsonEncode({'error': 'Shop not found'}));
+    }
+    await db.execute(
+      'UPDATE shops SET status = ?, license_start_date = ?, license_expiry_date = ?, is_lifetime = ?, updated_at = ? WHERE shop_id = ?',
+      [
+        'active',
+        body['licenseStartDate']?.toString() ?? utcNow(),
+        expiry,
+        isLifetime,
+        utcNow(),
+        shopId,
+      ],
+    );
+    return shelf.Response.ok(jsonEncode({'success': true, 'shopId': shopId}));
   }
 
   Future<shelf.Response> _login(shelf.Request request) async {
@@ -1093,6 +1208,40 @@ class ServerApp {
         user['shop_id']?.toString() ??
         (superAdminRows.isNotEmpty ? 'SUPER_ADMIN' : suppliedShopId);
     final role = user['role']?.toString() ?? 'employee';
+    if (role != 'super_admin') {
+      final shopRows = await db.select(
+        'SELECT status, license_assigned, license_expiry_date, is_lifetime FROM shops WHERE shop_id = ?',
+        [shopId],
+      );
+      if (shopRows.isNotEmpty) {
+        final shop = shopRows.first;
+        final isLifetime =
+            shop['is_lifetime'] == true || shop['is_lifetime'] == 1;
+        final expiry = DateTime.tryParse(
+          shop['license_expiry_date']?.toString() ?? '',
+        );
+        final expired =
+          shop['license_assigned'] == true &&
+          !isLifetime &&
+            expiry != null &&
+            DateTime.now().toUtc().isAfter(expiry);
+        if (expired && shop['status'] != 'suspended') {
+          await db.execute(
+            'UPDATE shops SET status = ?, updated_at = ? WHERE shop_id = ?',
+            ['suspended', utcNow(), shopId],
+          );
+        }
+        if (shop['status'] == 'suspended' || expired) {
+          return shelf.Response(
+            403,
+            body: jsonEncode({
+              'error': 'Your shop license has expired. Please contact the administrator to renew your license.',
+              'code': 'SHOP_LICENSE_EXPIRED',
+            }),
+          );
+        }
+      }
+    }
     if (role != 'super_admin' &&
         suppliedShopId.isNotEmpty &&
         suppliedShopId != shopId) {
@@ -1136,6 +1285,26 @@ class ServerApp {
       'expiresAt': expiresAt,
       'createdAt': now,
     };
+    if (role != 'super_admin') {
+      final licenseRows = await db.select(
+        'SELECT license_start_date, license_expiry_date, is_lifetime, license_assigned FROM shops WHERE shop_id = ?',
+        [shopId],
+      );
+      if (licenseRows.isNotEmpty) {
+        sessionPayload['licenseStartDate'] =
+            licenseRows.first['license_start_date'];
+        sessionPayload['licenseExpiryDate'] =
+            licenseRows.first['license_expiry_date'];
+        sessionPayload['isLifetime'] =
+            licenseRows.first['is_lifetime'] == true ||
+            licenseRows.first['is_lifetime'] == 1;
+          sessionPayload['licenseAssigned'] = licenseRows.first['license_assigned'] == true || licenseRows.first['license_assigned'] == 1;
+        sessionPayload['licenseAssigned'] =
+            licenseRows.first['license_start_date'] != null ||
+            licenseRows.first['license_expiry_date'] != null ||
+            sessionPayload['isLifetime'] == true;
+      }
+    }
 
     try {
       await db.execute(
@@ -1480,6 +1649,26 @@ class ServerApp {
       await db.execute('DELETE FROM sessions WHERE token = ?', [token]);
       return null;
     }
+    if (session['role'] != 'super_admin') {
+      final shopRows = await db.select(
+        'SELECT status, license_expiry_date, is_lifetime FROM shops WHERE shop_id = ?',
+        [session['shop_id']],
+      );
+      if (shopRows.isNotEmpty) {
+        final shop = shopRows.first;
+        final lifetime =
+            shop['is_lifetime'] == true || shop['is_lifetime'] == 1;
+        final expiry = DateTime.tryParse(
+          shop['license_expiry_date']?.toString() ?? '',
+        );
+        if (shop['status'] == 'suspended' ||
+            (!lifetime &&
+                expiry != null &&
+                DateTime.now().toUtc().isAfter(expiry))) {
+          return null;
+        }
+      }
+    }
     return {'token': token, 'user': session};
   }
 
@@ -1584,6 +1773,9 @@ class ServerApp {
       }
       cleaned[key] = value;
     });
+    if (entityType.toLowerCase() == 'mobile_unit' && operation == 'delete') {
+      cleaned['is_deleted'] = 1;
+    }
 
     try {
       switch (entityType.toLowerCase()) {
@@ -1639,6 +1831,15 @@ class ServerApp {
     Map<String, dynamic> row,
     String operation,
   ) async {
+    if (tableName == 'mobile_units' && operation != 'delete') {
+      final existing = await db.select(
+        'SELECT is_deleted FROM mobile_units WHERE id = ? AND shop_id = ?',
+        [row['id'], row['shop_id']],
+      );
+      if (existing.isNotEmpty && (existing.first['is_deleted'] as num?) == 1) {
+        return;
+      }
+    }
     final columns = row.keys.toList();
     final createClause =
         'INSERT INTO $tableName (${columns.join(', ')}) VALUES (${List.filled(columns.length, '?').join(', ')}) ON CONFLICT(id) DO UPDATE SET ${columns.map((column) => '$column = excluded.$column').join(', ')}';
