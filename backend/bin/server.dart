@@ -97,7 +97,12 @@ class DatabaseAdapter {
     if (databaseUrl == null || databaseUrl.trim().isEmpty) {
       throw StateError('DATABASE_URL is required for the production backend');
     }
+    final startedAt = DateTime.now();
+    print('DB CONNECTION OPEN START');
     final connection = await Connection.openFromUrl(databaseUrl);
+    print(
+      'DB CONNECTION OPEN END elapsedMs=${DateTime.now().difference(startedAt).inMilliseconds}',
+    );
     return DatabaseAdapter._(connection);
   }
 
@@ -1114,15 +1119,14 @@ class ServerApp {
   }
 
   Future<shelf.Response> _login(shelf.Request request) async {
+    print('BACKEND LOGIN START');
     try {
-      return await _loginInternal(request);
-    } catch (error, stackTrace) {
-      final branch =
-          request.url.queryParameters['shopId']?.trim().isEmpty ?? true
-          ? 'super_admin'
-          : 'shop_admin_or_employee';
+      final response = await _loginInternal(request);
+      print('BACKEND LOGIN SUCCESS status=${response.statusCode}');
+      return response;
+    } catch (error) {
       print(
-        'Auth login exception branch=$branch type=${error.runtimeType} message=$error stackTrace=$stackTrace',
+        'BACKEND LOGIN FAILURE exceptionType=${error.runtimeType}',
       );
       return shelf.Response(
         500,
@@ -1209,7 +1213,8 @@ class ServerApp {
         (superAdminRows.isNotEmpty ? 'SUPER_ADMIN' : suppliedShopId);
     final role = user['role']?.toString() ?? 'employee';
     if (role != 'super_admin') {
-      final shopRows = await db.select(
+      final shopRows = await _timedSelect(
+        'DB LICENSE LOOKUP',
         'SELECT status, license_assigned, license_expiry_date, is_lifetime FROM shops WHERE shop_id = ?',
         [shopId],
       );
@@ -1261,6 +1266,7 @@ class ServerApp {
         .add(const Duration(hours: 24))
         .toIso8601String();
     final sessionWriteStartedAt = DateTime.now();
+    print('DB SESSION INSERT START');
     await db.execute(
       'INSERT INTO sessions (id, user_id, token, device_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
       [
@@ -1273,7 +1279,7 @@ class ServerApp {
       ],
     );
     print(
-      'LOGIN WRITE sessions stepMs=${DateTime.now().difference(sessionWriteStartedAt).inMilliseconds} totalMs=${stopwatch.elapsedMilliseconds}',
+      'DB SESSION INSERT END elapsedMs=${DateTime.now().difference(sessionWriteStartedAt).inMilliseconds}',
     );
 
     final sessionPayload = {
@@ -1286,7 +1292,8 @@ class ServerApp {
       'createdAt': now,
     };
     if (role != 'super_admin') {
-      final licenseRows = await db.select(
+      final licenseRows = await _timedSelect(
+        'DB LICENSE LOOKUP RESPONSE',
         'SELECT license_start_date, license_expiry_date, is_lifetime, license_assigned FROM shops WHERE shop_id = ?',
         [shopId],
       );
@@ -1307,6 +1314,8 @@ class ServerApp {
     }
 
     try {
+      final deviceWriteStartedAt = DateTime.now();
+      print('DB DEVICE UPSERT START');
       await db.execute(
         'INSERT INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, device_id) DO UPDATE SET user_id = EXCLUDED.user_id, imei = EXCLUDED.imei, device_name = EXCLUDED.device_name, device_type = EXCLUDED.device_type, last_seen_at = EXCLUDED.last_seen_at',
         [
@@ -1321,9 +1330,12 @@ class ServerApp {
           now,
         ],
       );
-    } catch (error, stackTrace) {
       print(
-        'Auth login device-write exception branch=${role == 'super_admin' ? 'super_admin' : 'shop_admin_or_employee'} type=${error.runtimeType} message=$error stackTrace=$stackTrace',
+        'DB DEVICE UPSERT END elapsedMs=${DateTime.now().difference(deviceWriteStartedAt).inMilliseconds}',
+      );
+    } catch (error) {
+      print(
+        'DB DEVICE UPSERT FAILURE exceptionType=${error.runtimeType}',
       );
       rethrow;
     }
@@ -1682,12 +1694,12 @@ class ServerApp {
     try {
       final rows = await db.select(sql, parameters);
       print(
-        '$label COMPLETE rows=${rows.length} stepMs=${DateTime.now().difference(startedAt).inMilliseconds}',
+        '$label END status=success elapsedMs=${DateTime.now().difference(startedAt).inMilliseconds}',
       );
       return rows;
     } catch (error) {
       print(
-        '$label FAILED error=$error stepMs=${DateTime.now().difference(startedAt).inMilliseconds}',
+        '$label END status=failure exceptionType=${error.runtimeType} elapsedMs=${DateTime.now().difference(startedAt).inMilliseconds}',
       );
       rethrow;
     }
