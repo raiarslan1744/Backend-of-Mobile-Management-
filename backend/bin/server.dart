@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -7,6 +8,8 @@ import 'package:shelf/shelf.dart' as shelf;
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart';
 import 'package:uuid/uuid.dart';
+
+import '../lib/sync_engine.dart';
 
 String hashPassword(String password) {
   return sha256.convert(utf8.encode(password)).toString();
@@ -87,10 +90,36 @@ String? authTokenFromRequest(shelf.Request request) {
   return authHeader.substring('Bearer '.length).trim();
 }
 
-class DatabaseAdapter {
+class DatabaseAdapter implements SyncDatabase {
   DatabaseAdapter._(this.postgresConnection);
 
   final Connection postgresConnection;
+  static final _transactionKey = Object();
+  Session get _session =>
+      Zone.current[_transactionKey] as Session? ?? postgresConnection;
+  final _columnCache = <String, Map<String, String>>{};
+
+  @override
+  Future<T> syncTransaction<T>(Future<T> Function() action) =>
+      postgresConnection.runTx(
+        (transaction) => runZoned(() async {
+          await transaction.execute('SELECT pg_advisory_xact_lock(825017431)');
+          return action();
+        }, zoneValues: {_transactionKey: transaction}),
+      );
+
+  @override
+  Future<Map<String, String>> columns(String table) async {
+    if (_columnCache.containsKey(table)) return _columnCache[table]!;
+    final rows = await select(
+      'SELECT column_name,data_type FROM information_schema.columns WHERE table_schema=? AND table_name=?',
+      ['public', table],
+    );
+    return _columnCache[table] = {
+      for (final row in rows)
+        row['column_name'] as String: row['data_type'] as String,
+    };
+  }
 
   static Future<DatabaseAdapter> open() async {
     final databaseUrl = Platform.environment['DATABASE_URL'];
@@ -106,7 +135,7 @@ class DatabaseAdapter {
     List<Object?> parameters = const [],
   ]) async {
     final normalized = _normalizeSql(sql, parameters);
-    final result = await postgresConnection.execute(
+    final result = await _session.execute(
       normalized.sql,
       parameters: normalized.values,
     );
@@ -120,10 +149,7 @@ class DatabaseAdapter {
     List<Object?> parameters = const [],
   ]) async {
     final normalized = _normalizeSql(sql, parameters);
-    await postgresConnection.execute(
-      normalized.sql,
-      parameters: normalized.values,
-    );
+    await _session.execute(normalized.sql, parameters: normalized.values);
   }
 
   Future<void> dispose() async {
@@ -236,11 +262,23 @@ class ServerApp {
 
     final database = await DatabaseAdapter.open();
     final app = ServerApp._(dbPath ?? 'postgresql', database);
-    await app._initializeSchema();
+    // Normal API startup only connects to an existing database.
+    // Schema and super-admin setup require the separate explicit bootstrap.
     app._registerRoutes();
     _activeInstance = app;
     await app.listen(host: InternetAddress.anyIPv4, port: resolvedPort);
     return app;
+  }
+
+  /// Mutates the configured database; only call for explicitly authorized setup.
+  /// Normal API startup never invokes this method.
+  static Future<void> initializeDatabaseForSetup() async {
+    final database = await DatabaseAdapter.open();
+    try {
+      await ServerApp._('postgresql', database)._initializeSchema();
+    } finally {
+      await database.dispose();
+    }
   }
 
   static Future<void> stopAll() async {
@@ -647,6 +685,10 @@ class ServerApp {
     router.get('/api/auth/validate-shop-access', _validateShopAccess);
     router.post('/api/auth/register-device', _registerDevice);
     router.post('/api/sync/upload', _uploadSync);
+    router.get('/api/sync/protocol', (shelf.Request request) async {
+      if (await _requireAuth(request) == null) return shelf.Response(401);
+      return shelf.Response.ok(jsonEncode({'version': 2}));
+    });
     router.post('/api/sync/download', _downloadSync);
     router.get('/api/sync/initial', _initialSync);
     router.post('/api/sync/conflict-report', _reportConflict);
@@ -1066,7 +1108,9 @@ class ServerApp {
                 'licenseExpiryDate': row['license_expiry_date'],
                 'isLifetime':
                     row['is_lifetime'] == true || row['is_lifetime'] == 1,
-                'licenseAssigned': row['license_assigned'] == true || row['license_assigned'] == 1,
+                'licenseAssigned':
+                    row['license_assigned'] == true ||
+                    row['license_assigned'] == 1,
               },
             )
             .toList(),
@@ -1117,9 +1161,7 @@ class ServerApp {
     try {
       return await _loginInternal(request);
     } catch (error) {
-      print(
-        'Auth login exception type=${error.runtimeType}',
-      );
+      print('Auth login exception type=${error.runtimeType}');
       return shelf.Response(
         500,
         body: jsonEncode({'error': 'Authentication server error'}),
@@ -1148,7 +1190,7 @@ class ServerApp {
           )
         : const <Map<String, Object?>>[];
     final employeeRows = await db.select(
-      'SELECT * FROM employees WHERE username = ? AND shop_id = ? AND password_hash = ?',
+      "SELECT * FROM employees WHERE username = ? AND shop_id = ? AND password_hash = ? AND status = 'active' AND is_deleted = 0",
       [username, suppliedShopId, hashPassword(password)],
     );
     if (superAdminRows.isEmpty &&
@@ -1201,8 +1243,8 @@ class ServerApp {
           shop['license_expiry_date']?.toString() ?? '',
         );
         final expired =
-          shop['license_assigned'] == true &&
-          !isLifetime &&
+            shop['license_assigned'] == true &&
+            !isLifetime &&
             expiry != null &&
             DateTime.now().toUtc().isAfter(expiry);
         if (expired && shop['status'] != 'suspended') {
@@ -1273,7 +1315,9 @@ class ServerApp {
         sessionPayload['isLifetime'] =
             licenseRows.first['is_lifetime'] == true ||
             licenseRows.first['is_lifetime'] == 1;
-          sessionPayload['licenseAssigned'] = licenseRows.first['license_assigned'] == true || licenseRows.first['license_assigned'] == 1;
+        sessionPayload['licenseAssigned'] =
+            licenseRows.first['license_assigned'] == true ||
+            licenseRows.first['license_assigned'] == 1;
         sessionPayload['licenseAssigned'] =
             licenseRows.first['license_start_date'] != null ||
             licenseRows.first['license_expiry_date'] != null ||
@@ -1297,9 +1341,7 @@ class ServerApp {
         ],
       );
     } catch (error) {
-      print(
-        'Auth login device-write exception type=${error.runtimeType}',
-      );
+      print('Auth login device-write exception type=${error.runtimeType}');
       rethrow;
     }
 
@@ -1361,73 +1403,37 @@ class ServerApp {
 
   Future<shelf.Response> _uploadSync(shelf.Request request) async {
     final auth = await _requireAuth(request);
-    if (auth == null) {
+    if (auth == null)
       return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
-    }
-
     final body = await _body(request);
-    final items = body['items'] as List<dynamic>? ?? const [];
-    final user = auth['user'];
-    final now = utcNow();
-    var synced = 0;
+    final items = body['items'];
+    if (items is! List || items.length > 500)
+      return shelf.Response(400, body: jsonEncode({'error': 'Invalid batch'}));
+    final engine = SyncEngine(db);
     final conflicts = <Map<String, dynamic>>[];
-
+    final accepted = <Map<String, dynamic>>[];
     for (final item in items) {
-      final map = Map<String, dynamic>.from(item as Map<String, dynamic>);
-      final shopId = map['shopId']?.toString() ?? user['shop_id'] as String;
-      if (shopId != user['shop_id']) {
-        conflicts.add({
-          'error': 'Shop ID mismatch',
-          'entityId': map['entityId'],
-        });
-        continue;
-      }
-
-      final entityType = map['entityType']?.toString() ?? 'unknown';
-      final entityId =
-          (map['entityId'] ?? map['id'])?.toString() ?? const Uuid().v4();
-      final operation = map['operation']?.toString() ?? 'update';
-      final data = Map<String, dynamic>.from(
-        map['data'] as Map<String, dynamic>? ?? {},
-      );
-      data['id'] = entityId;
-      data['shop_id'] = shopId;
-      final recordId = map['id']?.toString() ?? const Uuid().v4();
-      final recordTs = (map['createdAt'] ?? now).toString();
-
-      await db.execute(
-        'INSERT OR REPLACE INTO sync_records (id, shop_id, entity_type, entity_id, operation, data, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        [
-          recordId,
-          shopId,
-          entityType,
-          entityId,
-          operation,
-          jsonEncode(data),
-          recordTs,
-          recordTs,
-          operation == 'delete' ? 1 : 0,
-        ],
-      );
-
-      final applied = await _applyEntityRecord(
-        shopId,
-        entityType,
-        entityId,
-        operation,
-        data,
-        now,
-      );
-      if (applied) {
-        synced++;
+      try {
+        final outcome = await engine.upload(
+          auth['user']['shop_id'] as String,
+          auth['user']['role'] as String,
+          Map<String, dynamic>.from(item as Map),
+        );
+        if (outcome['accepted'] == true) {
+          accepted.add(outcome);
+        } else {
+          conflicts.add(outcome);
+        }
+      } catch (_) {
+        // No acknowledgements or change-log entry survive a failed transaction.
+        conflicts.add({'code': 'SAVE_FAILED'});
       }
     }
-
     return shelf.Response.ok(
       jsonEncode({
-        'itemsSynced': synced,
+        'itemsSynced': accepted.length,
         'itemsFailed': conflicts.length,
-        'timestamp': now,
+        'results': accepted,
         'conflicts': conflicts,
       }),
     );
@@ -1435,48 +1441,22 @@ class ServerApp {
 
   Future<shelf.Response> _downloadSync(shelf.Request request) async {
     final auth = await _requireAuth(request);
-    if (auth == null) {
+    if (auth == null)
       return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
-    }
-
     final body = await _body(request);
-    final lastSyncTime =
-        body['lastSyncTime']?.toString() ?? '1970-01-01T00:00:00.000Z';
-    final entityTypes = (body['entityTypes'] as List<dynamic>? ?? const [])
-        .map((e) => e.toString())
-        .toList();
-    final shopId = auth['user']['shop_id'] as String;
-
-    final changeRows = await db.select(
-      'SELECT * FROM sync_records WHERE shop_id = ? AND updated_at > ? ${entityTypes.isNotEmpty ? "AND entity_type IN (${List.filled(entityTypes.length, '?').join(', ')})" : ''} ORDER BY updated_at ASC LIMIT ?',
-      [
-        shopId,
-        lastSyncTime,
-        ...entityTypes,
-        body['batchSize'] is int ? body['batchSize'] as int : 200,
-      ],
-    );
-
-    final changes = <Map<String, dynamic>>[];
-    for (final row in changeRows) {
-      final payload = jsonDecode(row['data'] as String) as Map<String, dynamic>;
-      payload['_id'] = row['entity_id'];
-      payload['_type'] = row['entity_type'];
-      payload['entityType'] = row['entity_type'];
-      payload['shopId'] = row['shop_id'];
-      payload['operation'] = row['operation'];
-      payload['timestamp'] = row['updated_at'];
-      changes.add(payload);
+    try {
+      final result = await SyncEngine(db).download(
+        auth['user']['shop_id'] as String,
+        cursor: body['cursor']?.toString(),
+        limit: body['batchSize'] is int ? body['batchSize'] as int : 200,
+      );
+      return shelf.Response.ok(jsonEncode(result));
+    } on FormatException {
+      return shelf.Response(
+        400,
+        body: jsonEncode({'error': 'Invalid sync cursor'}),
+      );
     }
-
-    return shelf.Response.ok(
-      jsonEncode({
-        'changes': changes,
-        'lastSyncTime': utcNow(),
-        'hasMore': false,
-        'totalCount': changes.length,
-      }),
-    );
   }
 
   Future<shelf.Response> _initialSync(shelf.Request request) async {
@@ -1618,6 +1598,13 @@ class ServerApp {
       await db.execute('DELETE FROM sessions WHERE token = ?', [token]);
       return null;
     }
+    if (session['role'] == 'employee') {
+      final employee = await db.select(
+        "SELECT id FROM employees WHERE shop_id=? AND username=? AND status='active' AND is_deleted=0",
+        [session['shop_id'], session['username']],
+      );
+      if (employee.isEmpty) return null;
+    }
     if (session['role'] != 'super_admin') {
       final shopRows = await db.select(
         'SELECT status, license_expiry_date, is_lifetime FROM shops WHERE shop_id = ?',
@@ -1657,158 +1644,7 @@ class ServerApp {
   Future<List<Map<String, dynamic>>> _fetchTableRows(
     String tableName,
     String shopId,
-  ) async {
-    // These two existing tables have no soft-delete column. Keep their
-    // snapshot queries consistent with the inventory list endpoints.
-    final deletionFilter =
-        tableName == 'mobile_models' || tableName == 'suppliers'
-        ? ''
-        : ' AND is_deleted = 0';
-    final rows = await db.select(
-      'SELECT * FROM $tableName WHERE shop_id = ?$deletionFilter ORDER BY updated_at DESC',
-      [shopId],
-    );
-    return rows
-        .map((row) {
-          final map = <String, dynamic>{};
-          for (final entry in row.entries) {
-            if (entry.key == 'password_hash') continue;
-            map[entry.key] = entry.value;
-          }
-          if (map.containsKey('updated_at')) {
-            map['updatedAt'] = map['updated_at'];
-          }
-          if (map.containsKey('created_at')) {
-            map['createdAt'] = map['created_at'];
-          }
-          return map;
-        })
-        .toList(growable: false);
-  }
-
-  Future<bool> _applyEntityRecord(
-    String shopId,
-    String entityType,
-    String entityId,
-    String operation,
-    Map<String, dynamic> data,
-    String now,
-  ) async {
-    final cleaned = <String, dynamic>{};
-    cleaned['id'] = entityId;
-    cleaned['shop_id'] = shopId;
-    cleaned['updated_at'] = data['updatedAt'] ?? data['updated_at'] ?? now;
-    cleaned['created_at'] = data['createdAt'] ?? data['created_at'] ?? now;
-    cleaned['is_deleted'] = operation == 'delete' ? 1 : 0;
-
-    data.forEach((key, value) {
-      if (key == 'id' ||
-          key == 'shopId' ||
-          key == '_id' ||
-          key == 'entityId' ||
-          key == 'entity_id') {
-        return;
-      }
-      if (key == 'shop_id' || key == 'shopId') {
-        cleaned['shop_id'] = shopId;
-        return;
-      }
-      if (key == 'updatedAt' || key == 'updated_at') {
-        cleaned['updated_at'] = value;
-        return;
-      }
-      if (key == 'createdAt' || key == 'created_at') {
-        cleaned['created_at'] = value;
-        return;
-      }
-      if (key == 'password') {
-        cleaned['password_hash'] = hashPassword(value.toString());
-        return;
-      }
-      cleaned[key] = value;
-    });
-    if (entityType.toLowerCase() == 'mobile_unit' && operation == 'delete') {
-      cleaned['is_deleted'] = 1;
-    }
-
-    try {
-      switch (entityType.toLowerCase()) {
-        case 'product':
-          await _upsertEntity('products', cleaned, operation);
-          return true;
-        case 'sale':
-          await _upsertEntity('sales', cleaned, operation);
-          return true;
-        case 'customer':
-          await _upsertEntity('customers', cleaned, operation);
-          return true;
-        case 'employee':
-          await _upsertEntity('employees', cleaned, operation);
-          return true;
-        case 'repair':
-          await _upsertEntity('repairs', cleaned, operation);
-          return true;
-        case 'debtor':
-          await _upsertEntity('debtors', cleaned, operation);
-          return true;
-        case 'accessory':
-          await _upsertEntity('accessories', cleaned, operation);
-          return true;
-        case 'mobile_device':
-          await _upsertEntity('mobile_devices', cleaned, operation);
-          return true;
-        case 'purchase':
-          await _upsertEntity('purchases', cleaned, operation);
-          return true;
-        case 'mobile_model':
-          await _upsertEntity('mobile_models', cleaned, operation);
-          return true;
-        case 'mobile_unit':
-          await _upsertEntity('mobile_units', cleaned, operation);
-          return true;
-        case 'supplier':
-          await _upsertEntity('suppliers', cleaned, operation);
-          return true;
-        case 'return':
-          await _upsertEntity('returns', cleaned, operation);
-          return true;
-        default:
-          return false;
-      }
-    } catch (_) {
-      return false;
-    }
-  }
-
-  Future<void> _upsertEntity(
-    String tableName,
-    Map<String, dynamic> row,
-    String operation,
-  ) async {
-    if (tableName == 'mobile_units' && operation != 'delete') {
-      final existing = await db.select(
-        'SELECT is_deleted FROM mobile_units WHERE id = ? AND shop_id = ?',
-        [row['id'], row['shop_id']],
-      );
-      if (existing.isNotEmpty && (existing.first['is_deleted'] as num?) == 1) {
-        return;
-      }
-    }
-    final columns = row.keys.toList();
-    final createClause =
-        'INSERT INTO $tableName (${columns.join(', ')}) VALUES (${List.filled(columns.length, '?').join(', ')}) ON CONFLICT(id) DO UPDATE SET ${columns.map((column) => '$column = excluded.$column').join(', ')}';
-    final values = columns.map((column) => row[column]).toList();
-
-    if (operation == 'delete') {
-      await db.execute(
-        'UPDATE $tableName SET is_deleted = 1, updated_at = ? WHERE id = ? AND shop_id = ?',
-        [row['updated_at'] ?? utcNow(), row['id'], row['shop_id']],
-      );
-      return;
-    }
-
-    await db.execute(createClause, values);
-  }
+  ) => SyncEngine(db).snapshot(shopId, tableName);
 
   // Mobile Model Endpoints
   Future<shelf.Response> _createMobileModel(shelf.Request request) async {
