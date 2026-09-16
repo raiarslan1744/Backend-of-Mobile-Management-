@@ -1658,8 +1658,14 @@ class ServerApp {
     String tableName,
     String shopId,
   ) async {
+    // These two existing tables have no soft-delete column. Keep their
+    // snapshot queries consistent with the inventory list endpoints.
+    final deletionFilter =
+        tableName == 'mobile_models' || tableName == 'suppliers'
+        ? ''
+        : ' AND is_deleted = 0';
     final rows = await db.select(
-      'SELECT * FROM $tableName WHERE shop_id = ? AND is_deleted = 0 ORDER BY updated_at DESC',
+      'SELECT * FROM $tableName WHERE shop_id = ?$deletionFilter ORDER BY updated_at DESC',
       [shopId],
     );
     return rows
