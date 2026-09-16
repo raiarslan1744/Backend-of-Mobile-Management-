@@ -97,12 +97,7 @@ class DatabaseAdapter {
     if (databaseUrl == null || databaseUrl.trim().isEmpty) {
       throw StateError('DATABASE_URL is required for the production backend');
     }
-    final startedAt = DateTime.now();
-    print('DB CONNECTION OPEN START');
     final connection = await Connection.openFromUrl(databaseUrl);
-    print(
-      'DB CONNECTION OPEN END elapsedMs=${DateTime.now().difference(startedAt).inMilliseconds}',
-    );
     return DatabaseAdapter._(connection);
   }
 
@@ -1119,14 +1114,11 @@ class ServerApp {
   }
 
   Future<shelf.Response> _login(shelf.Request request) async {
-    print('BACKEND LOGIN START');
     try {
-      final response = await _loginInternal(request);
-      print('BACKEND LOGIN SUCCESS status=${response.statusCode}');
-      return response;
+      return await _loginInternal(request);
     } catch (error) {
       print(
-        'BACKEND LOGIN FAILURE exceptionType=${error.runtimeType}',
+        'Auth login exception type=${error.runtimeType}',
       );
       return shelf.Response(
         500,
@@ -1136,37 +1128,26 @@ class ServerApp {
   }
 
   Future<shelf.Response> _loginInternal(shelf.Request request) async {
-    final stopwatch = Stopwatch()..start();
     final body = await _body(request);
     final username = body['username']?.toString().trim() ?? '';
     final suppliedShopId = body['shopId']?.toString().trim() ?? '';
     final password = body['password']?.toString() ?? '';
     final deviceId = body['deviceId']?.toString() ?? 'unknown-device';
-    if (Platform.environment['DART_ENV'] == 'development') {
-      print(
-        'Auth login start branch=${suppliedShopId.isEmpty ? 'super_admin' : 'shop_admin_or_employee'} elapsedMs=${stopwatch.elapsedMilliseconds}',
-      );
-    }
-
-    final superAdminRows = await _timedSelect(
-      'LOGIN QUERY super_admin',
+    final superAdminRows = await db.select(
       'SELECT * FROM users WHERE username = ? AND role = ? AND password_hash = ?',
       [username, 'super_admin', hashPassword(password)],
     );
-    final shopAdminRows = await _timedSelect(
-      'LOGIN QUERY shop_admin',
+    final shopAdminRows = await db.select(
       'SELECT * FROM users WHERE username = ? AND shop_id = ? AND password_hash = ? AND role = ?',
       [username, suppliedShopId, hashPassword(password), 'admin'],
     );
     final shopCredentialRows = shopAdminRows.isEmpty
-        ? await _timedSelect(
-            'LOGIN QUERY shop_credentials',
+        ? await db.select(
             'SELECT * FROM shops WHERE username = ? AND shop_id = ? AND password_hash = ?',
             [username, suppliedShopId, hashPassword(password)],
           )
         : const <Map<String, Object?>>[];
-    final employeeRows = await _timedSelect(
-      'LOGIN QUERY employee',
+    final employeeRows = await db.select(
       'SELECT * FROM employees WHERE username = ? AND shop_id = ? AND password_hash = ?',
       [username, suppliedShopId, hashPassword(password)],
     );
@@ -1174,11 +1155,6 @@ class ServerApp {
         shopAdminRows.isEmpty &&
         shopCredentialRows.isEmpty &&
         employeeRows.isEmpty) {
-      if (Platform.environment['DART_ENV'] == 'development') {
-        print(
-          'Auth login result=invalid accountType=${suppliedShopId.isEmpty ? 'super_admin' : 'shop_or_employee'} status=401 elapsedMs=${stopwatch.elapsedMilliseconds}',
-        );
-      }
       return shelf.Response(
         401,
         body: jsonEncode({
@@ -1213,8 +1189,7 @@ class ServerApp {
         (superAdminRows.isNotEmpty ? 'SUPER_ADMIN' : suppliedShopId);
     final role = user['role']?.toString() ?? 'employee';
     if (role != 'super_admin') {
-      final shopRows = await _timedSelect(
-        'DB LICENSE LOOKUP',
+      final shopRows = await db.select(
         'SELECT status, license_assigned, license_expiry_date, is_lifetime FROM shops WHERE shop_id = ?',
         [shopId],
       );
@@ -1265,8 +1240,6 @@ class ServerApp {
         .toUtc()
         .add(const Duration(hours: 24))
         .toIso8601String();
-    final sessionWriteStartedAt = DateTime.now();
-    print('DB SESSION INSERT START');
     await db.execute(
       'INSERT INTO sessions (id, user_id, token, device_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
       [
@@ -1278,10 +1251,6 @@ class ServerApp {
         now,
       ],
     );
-    print(
-      'DB SESSION INSERT END elapsedMs=${DateTime.now().difference(sessionWriteStartedAt).inMilliseconds}',
-    );
-
     final sessionPayload = {
       'userId': user['id'],
       'username': user['username'],
@@ -1292,8 +1261,7 @@ class ServerApp {
       'createdAt': now,
     };
     if (role != 'super_admin') {
-      final licenseRows = await _timedSelect(
-        'DB LICENSE LOOKUP RESPONSE',
+      final licenseRows = await db.select(
         'SELECT license_start_date, license_expiry_date, is_lifetime, license_assigned FROM shops WHERE shop_id = ?',
         [shopId],
       );
@@ -1314,8 +1282,6 @@ class ServerApp {
     }
 
     try {
-      final deviceWriteStartedAt = DateTime.now();
-      print('DB DEVICE UPSERT START');
       await db.execute(
         'INSERT INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, device_id) DO UPDATE SET user_id = EXCLUDED.user_id, imei = EXCLUDED.imei, device_name = EXCLUDED.device_name, device_type = EXCLUDED.device_type, last_seen_at = EXCLUDED.last_seen_at',
         [
@@ -1330,21 +1296,13 @@ class ServerApp {
           now,
         ],
       );
-      print(
-        'DB DEVICE UPSERT END elapsedMs=${DateTime.now().difference(deviceWriteStartedAt).inMilliseconds}',
-      );
     } catch (error) {
       print(
-        'DB DEVICE UPSERT FAILURE exceptionType=${error.runtimeType}',
+        'Auth login device-write exception type=${error.runtimeType}',
       );
       rethrow;
     }
 
-    if (Platform.environment['DART_ENV'] == 'development') {
-      print(
-        'Auth login result=success accountType=${role == 'super_admin' ? 'super_admin' : 'shop_or_employee'} status=200 elapsedMs=${stopwatch.elapsedMilliseconds}',
-      );
-    }
     return shelf.Response.ok(jsonEncode(sessionPayload));
   }
 
@@ -1649,8 +1607,7 @@ class ServerApp {
   Future<Map<String, dynamic>?> _requireAuth(shelf.Request request) async {
     final token = authTokenFromRequest(request);
     if (token == null) return null;
-    final rows = await _timedSelect(
-      'AUTH QUERY session',
+    final rows = await db.select(
       'SELECT s.*, u.username, u.shop_id, u.role, u.password_hash FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?',
       [token],
     );
@@ -1682,27 +1639,6 @@ class ServerApp {
       }
     }
     return {'token': token, 'user': session};
-  }
-
-  Future<List<Map<String, Object?>>> _timedSelect(
-    String label,
-    String sql,
-    List<Object?> parameters,
-  ) async {
-    final startedAt = DateTime.now();
-    print('$label START totalMs=0');
-    try {
-      final rows = await db.select(sql, parameters);
-      print(
-        '$label END status=success elapsedMs=${DateTime.now().difference(startedAt).inMilliseconds}',
-      );
-      return rows;
-    } catch (error) {
-      print(
-        '$label END status=failure exceptionType=${error.runtimeType} elapsedMs=${DateTime.now().difference(startedAt).inMilliseconds}',
-      );
-      rethrow;
-    }
   }
 
   Future<Map<String, dynamic>> _body(shelf.Request request) async {
