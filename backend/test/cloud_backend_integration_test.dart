@@ -7,20 +7,18 @@ import 'package:test/test.dart';
 import '../bin/server.dart';
 
 void main() {
-  final hasDatabase =
-      (Platform.environment['TEST_DATABASE_URL'] ??
-              Platform.environment['DATABASE_URL']) !=
-          null &&
-      (Platform.environment['TEST_DATABASE_URL'] ??
-              Platform.environment['DATABASE_URL'] ??
-              '')
-          .trim()
-          .isNotEmpty;
-
-  if (!hasDatabase) {
-    test('PostgreSQL integration tests are skipped when TEST_DATABASE_URL is not configured.', () {
-      expect(true, isTrue);
-    });
+  // Integration fixtures must never connect to a production database.
+  final uri = Uri.tryParse(Platform.environment['DATABASE_URL'] ?? '');
+  final isolated =
+      uri?.host == '127.0.0.1' &&
+      uri?.port == 55439 &&
+      uri?.path == '/ak_unification_test';
+  if (!isolated) {
+    test(
+      'isolated PostgreSQL integration fixture',
+      () {},
+      skip: 'Dedicated localhost PostgreSQL fixture is not configured.',
+    );
     return;
   }
 
@@ -50,6 +48,8 @@ void main() {
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
           'shopId': shopId,
+          'licenseAssigned': true,
+          'isLifetime': true,
           'ownerName': 'Ali',
           'contact': '12345',
           'address': 'Main Street',
@@ -82,14 +82,14 @@ void main() {
 
       final productsA = [
         {
-          'id': 'prod-1',
+          'id': '$shopId-prod-1',
           'name': 'Samsung A15',
           'quantity': 5,
           'price': 23000,
           'updatedAt': DateTime.now().toUtc().toIso8601String(),
         },
         {
-          'id': 'prod-2',
+          'id': '$shopId-prod-2',
           'name': 'PowerBank',
           'quantity': 12,
           'price': 1500,
@@ -120,6 +120,11 @@ void main() {
         }),
       );
       expect(uploadA.statusCode, 200, reason: uploadA.body);
+      expect(
+        (jsonDecode(uploadA.body) as Map)['itemsSynced'],
+        2,
+        reason: uploadA.body,
+      );
 
       final loginB = await http.post(
         Uri.parse('http://127.0.0.1:8080/api/auth/login'),
@@ -152,12 +157,14 @@ void main() {
       expect(downloadB.statusCode, 200, reason: downloadB.body);
       final payload = jsonDecode(downloadB.body) as Map<String, dynamic>;
       final changes = payload['changes'] as List<dynamic>;
+      expect(changes, hasLength(2));
       expect(
-        changes.any(
-          (change) =>
-              (change as Map<String, dynamic>)['entityType'] == 'product',
-        ),
+        changes.every((change) => (change as Map)['_type'] == 'product'),
         isTrue,
+      );
+      expect(
+        changes.map((change) => (change as Map)['id']).toSet(),
+        equals({'$shopId-prod-1', '$shopId-prod-2'}),
       );
     });
 
@@ -174,6 +181,8 @@ void main() {
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
             'shopId': shopId,
+            'licenseAssigned': true,
+            'isLifetime': true,
             'ownerName': 'Ali',
             'contact': '12345',
             'address': 'Addr 1',
@@ -188,6 +197,8 @@ void main() {
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
             'shopId': otherShopId,
+            'licenseAssigned': true,
+            'isLifetime': true,
             'ownerName': 'Other',
             'contact': '67890',
             'address': 'Addr 2',
@@ -271,6 +282,8 @@ void main() {
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
           'shopId': originalShopId,
+          'licenseAssigned': true,
+          'isLifetime': true,
           'ownerName': 'Delete Test',
           'contact': '12345',
           'address': 'Deleted Street',
@@ -325,6 +338,8 @@ void main() {
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
           'shopId': originalShopId,
+          'licenseAssigned': true,
+          'isLifetime': true,
           'ownerName': 'Fresh Shop Owner',
           'contact': '99999',
           'address': 'New Street',
@@ -372,7 +387,16 @@ void main() {
         ),
         headers: {'Authorization': 'Bearer $superToken'},
       );
-      expect(repeatedDelete.statusCode, 404);
+      // The recreated shop exists, so deleting it succeeds. A further repeat
+      // must report missing; the old fixture skipped this second deletion.
+      expect(repeatedDelete.statusCode, 200);
+      final missingDelete = await http.delete(
+        Uri.parse(
+          'http://127.0.0.1:8080/api/super-admin/shops/$originalShopId',
+        ),
+        headers: {'Authorization': 'Bearer $superToken'},
+      );
+      expect(missingDelete.statusCode, 404);
     });
   });
 }
