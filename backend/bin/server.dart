@@ -1176,8 +1176,18 @@ class ServerApp {
   Future<shelf.Response> _login(shelf.Request request) async {
     try {
       return await _loginInternal(request);
-    } catch (error) {
-      print('Auth login exception type=${error.runtimeType}');
+    } catch (error, stackTrace) {
+      final diagnosticMessage = error
+          .toString()
+          .replaceAll(
+            RegExp(r'(?i)(password|token|secret|authorization)\s*[=:]\s*[^\s,}]+'),
+            r'$1=[redacted]',
+          )
+          .replaceAll(RegExp(r'Bearer\s+\S+', caseSensitive: false), 'Bearer [redacted]');
+      print(
+        'AUTH_LOGIN_EXCEPTION type=${error.runtimeType} message=$diagnosticMessage',
+      );
+      print('AUTH_LOGIN_STACK $stackTrace');
       return shelf.Response(
         500,
         body: jsonEncode({'error': 'Authentication server error'}),
