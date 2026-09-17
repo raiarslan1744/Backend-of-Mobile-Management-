@@ -626,6 +626,22 @@ class ServerApp {
     ''');
 
     await _ensureColumn('sales', 'bill_number', 'TEXT');
+    await _ensureColumn('sales', 'product_id', 'TEXT');
+    await _ensureColumn('sales', 'sold_at', 'TEXT');
+    await _ensureColumn('purchases', 'product_id', 'TEXT');
+    await _ensureColumn('purchases', 'purchased_at', 'TEXT');
+    await _ensureColumn('returns', 'sale_amount', 'REAL NOT NULL DEFAULT 0');
+    await _ensureColumn(
+      'returns',
+      'purchase_amount',
+      'REAL NOT NULL DEFAULT 0',
+    );
+    await _ensureColumn(
+      'mobile_models',
+      'is_deleted',
+      'INTEGER NOT NULL DEFAULT 0',
+    );
+    await _ensureColumn('mobile_models', 'deleted_at', 'TEXT');
     await _ensureTableColumns();
   }
 
