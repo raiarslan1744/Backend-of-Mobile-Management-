@@ -108,9 +108,8 @@ String redactSensitiveAuthText(String message) {
 class DatabaseAdapter implements SyncDatabase {
   DatabaseAdapter._(this.postgresConnection);
 
-  final Connection postgresConnection;
+  final Pool postgresConnection;
   static final _transactionKey = Object();
-  Future<void> _connectionGate = Future<void>.value();
   Session get _session =>
       Zone.current[_transactionKey] as Session? ?? postgresConnection;
   bool get _inTransaction => Zone.current[_transactionKey] is Session;
@@ -119,14 +118,12 @@ class DatabaseAdapter implements SyncDatabase {
   @override
   Future<T> syncTransaction<T>(Future<T> Function() action) {
     if (_inTransaction) return action();
-    return _withConnection(() {
-      return postgresConnection.runTx(
-        (transaction) => runZoned(() async {
-          await transaction.execute('SELECT pg_advisory_xact_lock(825017431)');
-          return action();
-        }, zoneValues: {_transactionKey: transaction}),
-      );
-    });
+    return postgresConnection.runTx(
+      (transaction) => runZoned(() async {
+        await transaction.execute('SELECT pg_advisory_xact_lock(825017431)');
+        return action();
+      }, zoneValues: {_transactionKey: transaction}),
+    );
   }
 
   @override
@@ -147,7 +144,7 @@ class DatabaseAdapter implements SyncDatabase {
     if (databaseUrl == null || databaseUrl.trim().isEmpty) {
       throw StateError('DATABASE_URL is required for the production backend');
     }
-    final connection = await Connection.openFromUrl(databaseUrl);
+    final connection = Pool.withUrl(databaseUrl);
     return DatabaseAdapter._(connection);
   }
 
@@ -155,40 +152,22 @@ class DatabaseAdapter implements SyncDatabase {
     String sql, [
     List<Object?> parameters = const [],
   ]) async {
-    return _withConnection(() async {
-      final normalized = _normalizeSql(sql, parameters);
-      final result = await _session.execute(
-        normalized.sql,
-        parameters: normalized.values,
-      );
-      return result
-          .map((row) => Map<String, Object?>.from(row.toColumnMap()))
-          .toList(growable: false);
-    });
+    final normalized = _normalizeSql(sql, parameters);
+    final result = await _session.execute(
+      normalized.sql,
+      parameters: normalized.values,
+    );
+    return result
+        .map((row) => Map<String, Object?>.from(row.toColumnMap()))
+        .toList(growable: false);
   }
 
   Future<void> execute(
     String sql, [
     List<Object?> parameters = const [],
   ]) async {
-    await _withConnection(() async {
-      final normalized = _normalizeSql(sql, parameters);
-      await _session.execute(normalized.sql, parameters: normalized.values);
-    });
-  }
-
-  Future<T> _withConnection<T>(Future<T> Function() action) async {
-    if (_inTransaction) return action();
-
-    final previous = _connectionGate;
-    final release = Completer<void>();
-    _connectionGate = release.future;
-    await previous;
-    try {
-      return await action();
-    } finally {
-      release.complete();
-    }
+    final normalized = _normalizeSql(sql, parameters);
+    await _session.execute(normalized.sql, parameters: normalized.values);
   }
 
   Future<void> dispose() async {
