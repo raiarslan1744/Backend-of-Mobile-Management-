@@ -492,6 +492,55 @@ void main() {
         400,
       );
       expect((await login(body: '{not-json')).statusCode, 400);
+
+      final protocolWithoutAuth = await http.get(
+        Uri.parse('http://127.0.0.1:8080/api/sync/protocol'),
+      );
+      expect(protocolWithoutAuth.statusCode, 401);
+      final accessWithoutAuth = await http.get(
+        Uri.parse(
+          'http://127.0.0.1:8080/api/auth/validate-shop-access?shopId=$shopId',
+        ),
+      );
+      expect(accessWithoutAuth.statusCode, 401);
+
+      final token = session['authToken'] as String;
+      final protocol = await http.get(
+        Uri.parse('http://127.0.0.1:8080/api/sync/protocol'),
+        headers: {'Authorization': 'Bearer $token'},
+      );
+      expect(protocol.statusCode, 200, reason: protocol.body);
+      expect(jsonDecode(protocol.body), {'version': 2});
+      final shopAccess = await http.get(
+        Uri.parse(
+          'http://127.0.0.1:8080/api/auth/validate-shop-access?shopId=$shopId',
+        ),
+        headers: {'Authorization': 'Bearer $token'},
+      );
+      expect(shopAccess.statusCode, 200, reason: shopAccess.body);
+      expect((jsonDecode(shopAccess.body) as Map)['hasAccess'], isTrue);
+      final otherShopAccess = await http.get(
+        Uri.parse(
+          'http://127.0.0.1:8080/api/auth/validate-shop-access?shopId=0',
+        ),
+        headers: {'Authorization': 'Bearer $token'},
+      );
+      expect(otherShopAccess.statusCode, 403, reason: otherShopAccess.body);
+
+      final concurrentResponses = await Future.wait([
+        http.get(
+          Uri.parse('http://127.0.0.1:8080/api/sync/protocol'),
+          headers: {'Authorization': 'Bearer $token'},
+        ),
+        http.get(
+          Uri.parse(
+            'http://127.0.0.1:8080/api/auth/validate-shop-access?shopId=0',
+          ),
+          headers: {'Authorization': 'Bearer $token'},
+        ),
+      ]);
+      expect(concurrentResponses[0].statusCode, 200);
+      expect(concurrentResponses[1].statusCode, 403);
     });
 
     test('health endpoints remain available independently of login', () async {

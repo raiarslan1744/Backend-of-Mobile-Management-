@@ -90,23 +90,44 @@ String? authTokenFromRequest(shelf.Request request) {
   return authHeader.substring('Bearer '.length).trim();
 }
 
+String redactSensitiveAuthText(String message) {
+  return message
+      .replaceAll(
+        RegExp(r'Bearer\s+\S+', caseSensitive: false),
+        'Bearer [redacted]',
+      )
+      .replaceAllMapped(
+        RegExp(
+          r'''["']?(password|token|secret|authorization)["']?\s*[=:]\s*(?:"[^"]*"|'[^']*'|[^\s,}]+)''',
+          caseSensitive: false,
+        ),
+        (match) => '${match.group(1)}=[redacted]',
+      );
+}
+
 class DatabaseAdapter implements SyncDatabase {
   DatabaseAdapter._(this.postgresConnection);
 
   final Connection postgresConnection;
   static final _transactionKey = Object();
+  Future<void> _connectionGate = Future<void>.value();
   Session get _session =>
       Zone.current[_transactionKey] as Session? ?? postgresConnection;
+  bool get _inTransaction => Zone.current[_transactionKey] is Session;
   final _columnCache = <String, Map<String, String>>{};
 
   @override
-  Future<T> syncTransaction<T>(Future<T> Function() action) =>
-      postgresConnection.runTx(
+  Future<T> syncTransaction<T>(Future<T> Function() action) {
+    if (_inTransaction) return action();
+    return _withConnection(() {
+      return postgresConnection.runTx(
         (transaction) => runZoned(() async {
           await transaction.execute('SELECT pg_advisory_xact_lock(825017431)');
           return action();
         }, zoneValues: {_transactionKey: transaction}),
       );
+    });
+  }
 
   @override
   Future<Map<String, String>> columns(String table) async {
@@ -134,22 +155,40 @@ class DatabaseAdapter implements SyncDatabase {
     String sql, [
     List<Object?> parameters = const [],
   ]) async {
-    final normalized = _normalizeSql(sql, parameters);
-    final result = await _session.execute(
-      normalized.sql,
-      parameters: normalized.values,
-    );
-    return result
-        .map((row) => Map<String, Object?>.from(row.toColumnMap()))
-        .toList(growable: false);
+    return _withConnection(() async {
+      final normalized = _normalizeSql(sql, parameters);
+      final result = await _session.execute(
+        normalized.sql,
+        parameters: normalized.values,
+      );
+      return result
+          .map((row) => Map<String, Object?>.from(row.toColumnMap()))
+          .toList(growable: false);
+    });
   }
 
   Future<void> execute(
     String sql, [
     List<Object?> parameters = const [],
   ]) async {
-    final normalized = _normalizeSql(sql, parameters);
-    await _session.execute(normalized.sql, parameters: normalized.values);
+    await _withConnection(() async {
+      final normalized = _normalizeSql(sql, parameters);
+      await _session.execute(normalized.sql, parameters: normalized.values);
+    });
+  }
+
+  Future<T> _withConnection<T>(Future<T> Function() action) async {
+    if (_inTransaction) return action();
+
+    final previous = _connectionGate;
+    final release = Completer<void>();
+    _connectionGate = release.future;
+    await previous;
+    try {
+      return await action();
+    } finally {
+      release.complete();
+    }
   }
 
   Future<void> dispose() async {
@@ -1187,18 +1226,7 @@ class ServerApp {
         }),
       );
     } catch (error, stackTrace) {
-      final diagnosticMessage = error
-          .toString()
-          .replaceAll(
-            RegExp(
-              r'(?i)(password|token|secret|authorization)\s*[=:]\s*[^\s,}]+',
-            ),
-            r'$1=[redacted]',
-          )
-          .replaceAll(
-            RegExp(r'Bearer\s+\S+', caseSensitive: false),
-            'Bearer [redacted]',
-          );
+      final diagnosticMessage = redactSensitiveAuthText(error.toString());
       print(
         'AUTH_LOGIN_EXCEPTION type=${error.runtimeType} message=$diagnosticMessage',
       );
