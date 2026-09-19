@@ -1253,27 +1253,49 @@ class ServerApp {
         }),
       );
     }
-    final superAdminRows = await db.select(
-      'SELECT * FROM users WHERE username = ? AND role = ? AND password_hash = ?',
-      [username, 'super_admin', hashPassword(password)],
+    final passwordHash = hashPassword(password);
+    // Keep credential matching in one round trip. Render's database latency
+    // makes four sequential lookups approach the client's login timeout.
+    final credentialRows = await db.select(
+      '''
+      SELECT id, username, password_hash, shop_id, role, 1 AS priority
+      FROM users
+      WHERE username = ? AND password_hash = ?
+        AND (role = 'super_admin' OR (role = 'admin' AND shop_id = ?))
+      UNION ALL
+      SELECT 'shop:' || shop_id, username, password_hash, shop_id, 'admin', 2
+      FROM shops
+      WHERE username = ? AND password_hash = ? AND shop_id = ?
+      UNION ALL
+      SELECT id, username, password_hash, shop_id, 'employee', 3
+      FROM employees
+      WHERE username = ? AND password_hash = ? AND shop_id = ?
+        AND status = 'active' AND is_deleted = 0
+      ORDER BY priority
+      ''',
+      [
+        username,
+        passwordHash,
+        suppliedShopId,
+        username,
+        passwordHash,
+        suppliedShopId,
+        username,
+        passwordHash,
+        suppliedShopId,
+      ],
     );
-    final shopAdminRows = await db.select(
-      'SELECT * FROM users WHERE username = ? AND shop_id = ? AND password_hash = ? AND role = ?',
-      [username, suppliedShopId, hashPassword(password), 'admin'],
-    );
-    final shopCredentialRows = shopAdminRows.isEmpty
-        ? await db.select(
-            'SELECT * FROM shops WHERE username = ? AND shop_id = ? AND password_hash = ?',
-            [username, suppliedShopId, hashPassword(password)],
-          )
-        : const <Map<String, Object?>>[];
-    final employeeRows = await db.select(
-      "SELECT * FROM employees WHERE username = ? AND shop_id = ? AND password_hash = ? AND status = 'active' AND is_deleted = 0",
-      [username, suppliedShopId, hashPassword(password)],
-    );
+    final superAdminRows = credentialRows
+        .where((row) => row['role'] == 'super_admin')
+        .toList(growable: false);
+    final shopAdminRows = credentialRows
+        .where((row) => row['role'] == 'admin')
+        .toList(growable: false);
+    final employeeRows = credentialRows
+        .where((row) => row['role'] == 'employee')
+        .toList(growable: false);
     if (superAdminRows.isEmpty &&
         shopAdminRows.isEmpty &&
-        shopCredentialRows.isEmpty &&
         employeeRows.isEmpty) {
       if (suppliedShopId.isEmpty) {
         return shelf.Response(
@@ -1295,28 +1317,12 @@ class ServerApp {
 
     final user = superAdminRows.isNotEmpty
         ? superAdminRows.first
-        : (shopAdminRows.isNotEmpty
-              ? shopAdminRows.first
-              : (shopCredentialRows.isNotEmpty
-                    ? {
-                        'id': 'shop:${shopCredentialRows.first['shop_id']}',
-                        'username': shopCredentialRows.first['username'],
-                        'shop_id': shopCredentialRows.first['shop_id'],
-                        'role': 'admin',
-                        'password_hash':
-                            shopCredentialRows.first['password_hash'],
-                      }
-                    : {
-                        'id': employeeRows.first['id'],
-                        'username': employeeRows.first['username'],
-                        'shop_id': employeeRows.first['shop_id'],
-                        'role': 'employee',
-                        'password_hash': employeeRows.first['password_hash'],
-                      }));
+        : (shopAdminRows.isNotEmpty ? shopAdminRows.first : employeeRows.first);
     final shopId =
         user['shop_id']?.toString() ??
         (superAdminRows.isNotEmpty ? 'SUPER_ADMIN' : suppliedShopId);
     final role = user['role']?.toString() ?? 'employee';
+    Map<String, Object?>? shopInfo;
     if (role != 'super_admin') {
       final shopRows = await db.select(
         'SELECT status, license_assigned, license_expiry_date, is_lifetime FROM shops WHERE shop_id = ?',
@@ -1324,6 +1330,7 @@ class ServerApp {
       );
       if (shopRows.isNotEmpty) {
         final shop = shopRows.first;
+        shopInfo = shop;
         final isLifetime =
             shop['is_lifetime'] == true || shop['is_lifetime'] == 1;
         final expiry = DateTime.tryParse(
@@ -1389,27 +1396,18 @@ class ServerApp {
       'expiresAt': expiresAt,
       'createdAt': now,
     };
-    if (role != 'super_admin') {
-      final licenseRows = await db.select(
-        'SELECT license_start_date, license_expiry_date, is_lifetime, license_assigned FROM shops WHERE shop_id = ?',
-        [shopId],
-      );
-      if (licenseRows.isNotEmpty) {
-        sessionPayload['licenseStartDate'] =
-            licenseRows.first['license_start_date'];
-        sessionPayload['licenseExpiryDate'] =
-            licenseRows.first['license_expiry_date'];
-        sessionPayload['isLifetime'] =
-            licenseRows.first['is_lifetime'] == true ||
-            licenseRows.first['is_lifetime'] == 1;
-        sessionPayload['licenseAssigned'] =
-            licenseRows.first['license_assigned'] == true ||
-            licenseRows.first['license_assigned'] == 1;
-        sessionPayload['licenseAssigned'] =
-            licenseRows.first['license_start_date'] != null ||
-            licenseRows.first['license_expiry_date'] != null ||
-            sessionPayload['isLifetime'] == true;
-      }
+    if (role != 'super_admin' && shopInfo != null) {
+      sessionPayload['licenseStartDate'] = shopInfo['license_start_date'];
+      sessionPayload['licenseExpiryDate'] = shopInfo['license_expiry_date'];
+      sessionPayload['isLifetime'] =
+          shopInfo['is_lifetime'] == true || shopInfo['is_lifetime'] == 1;
+      sessionPayload['licenseAssigned'] =
+          shopInfo['license_assigned'] == true ||
+          shopInfo['license_assigned'] == 1;
+      sessionPayload['licenseAssigned'] =
+          shopInfo['license_start_date'] != null ||
+          shopInfo['license_expiry_date'] != null ||
+          sessionPayload['isLifetime'] == true;
     }
 
     try {
