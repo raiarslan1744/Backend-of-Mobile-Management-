@@ -398,5 +398,110 @@ void main() {
       );
       expect(missingDelete.statusCode, 404);
     });
+
+    test('login returns controlled responses for invalid requests', () async {
+      final shopId = 'SHOP-${DateTime.now().microsecondsSinceEpoch}';
+      final createShopResponse = await http.post(
+        Uri.parse('http://127.0.0.1:8080/api/shops'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'shopId': shopId,
+          'licenseAssigned': true,
+          'isLifetime': true,
+          'ownerName': 'Auth Test Owner',
+          'contact': '12345',
+          'address': 'Auth Test Street',
+          'username': 'auth-test-user',
+          'password': 'auth-test-password',
+        }),
+      );
+      expect(createShopResponse.statusCode, 200);
+
+      Future<http.Response> login({
+        String? username,
+        String? password,
+        String? requestedShopId,
+        Object? body,
+      }) => http.post(
+        Uri.parse('http://127.0.0.1:8080/api/auth/login'),
+        headers: {'Content-Type': 'application/json'},
+        body: body == null
+            ? jsonEncode({
+                if (username != null) 'username': username,
+                if (password != null) 'password': password,
+                if (requestedShopId != null) 'shopId': requestedShopId,
+                'deviceId': 'auth-validation-test',
+              })
+            : body,
+      );
+
+      final valid = await login(
+        username: 'auth-test-user',
+        password: 'auth-test-password',
+        requestedShopId: shopId,
+      );
+      expect(valid.statusCode, 200, reason: valid.body);
+      final session = jsonDecode(valid.body) as Map<String, dynamic>;
+      expect(session['authToken'], isA<String>());
+      expect(session['shopId'], shopId);
+      expect(session['role'], 'admin');
+
+      expect(
+        (await login(
+          username: 'auth-test-user',
+          password: 'wrong-password',
+          requestedShopId: shopId,
+        )).statusCode,
+        401,
+      );
+      expect(
+        (await login(
+          username: 'does-not-exist',
+          password: 'auth-test-password',
+          requestedShopId: shopId,
+        )).statusCode,
+        401,
+      );
+      expect(
+        (await login(
+          username: 'auth-test-user',
+          password: 'auth-test-password',
+          requestedShopId: 'SHOP-DOES-NOT-EXIST',
+        )).statusCode,
+        401,
+      );
+      expect(
+        (await login(
+          password: 'auth-test-password',
+          requestedShopId: shopId,
+        )).statusCode,
+        400,
+      );
+      expect(
+        (await login(
+          username: 'auth-test-user',
+          requestedShopId: shopId,
+        )).statusCode,
+        400,
+      );
+      expect(
+        (await login(
+          username: 'auth-test-user',
+          password: 'auth-test-password',
+        )).statusCode,
+        400,
+      );
+      expect((await login(body: '{not-json')).statusCode, 400);
+    });
+
+    test('health endpoints remain available independently of login', () async {
+      for (final path in ['/health', '/api/health']) {
+        final response = await http.get(
+          Uri.parse('http://127.0.0.1:8080$path'),
+        );
+        expect(response.statusCode, 200, reason: response.body);
+        expect((jsonDecode(response.body) as Map)['status'], 'healthy');
+      }
+    });
   });
 }

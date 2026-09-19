@@ -1176,14 +1176,29 @@ class ServerApp {
   Future<shelf.Response> _login(shelf.Request request) async {
     try {
       return await _loginInternal(request);
+    } on FormatException catch (error, stackTrace) {
+      print('AUTH_LOGIN_INVALID_REQUEST message=${error.message}');
+      print('AUTH_LOGIN_INVALID_REQUEST_STACK $stackTrace');
+      return shelf.Response(
+        400,
+        body: jsonEncode({
+          'error': 'Request body must be a valid JSON object',
+          'code': 'INVALID_REQUEST',
+        }),
+      );
     } catch (error, stackTrace) {
       final diagnosticMessage = error
           .toString()
           .replaceAll(
-            RegExp(r'(?i)(password|token|secret|authorization)\s*[=:]\s*[^\s,}]+'),
+            RegExp(
+              r'(?i)(password|token|secret|authorization)\s*[=:]\s*[^\s,}]+',
+            ),
             r'$1=[redacted]',
           )
-          .replaceAll(RegExp(r'Bearer\s+\S+', caseSensitive: false), 'Bearer [redacted]');
+          .replaceAll(
+            RegExp(r'Bearer\s+\S+', caseSensitive: false),
+            'Bearer [redacted]',
+          );
       print(
         'AUTH_LOGIN_EXCEPTION type=${error.runtimeType} message=$diagnosticMessage',
       );
@@ -1196,11 +1211,20 @@ class ServerApp {
   }
 
   Future<shelf.Response> _loginInternal(shelf.Request request) async {
-    final body = await _body(request);
+    final body = await _body(request, rejectMalformed: true);
     final username = body['username']?.toString().trim() ?? '';
     final suppliedShopId = body['shopId']?.toString().trim() ?? '';
     final password = body['password']?.toString() ?? '';
     final deviceId = body['deviceId']?.toString() ?? 'unknown-device';
+    if (username.isEmpty || password.isEmpty) {
+      return shelf.Response(
+        400,
+        body: jsonEncode({
+          'error': 'username and password are required',
+          'code': 'MISSING_CREDENTIALS',
+        }),
+      );
+    }
     final superAdminRows = await db.select(
       'SELECT * FROM users WHERE username = ? AND role = ? AND password_hash = ?',
       [username, 'super_admin', hashPassword(password)],
@@ -1223,6 +1247,15 @@ class ServerApp {
         shopAdminRows.isEmpty &&
         shopCredentialRows.isEmpty &&
         employeeRows.isEmpty) {
+      if (suppliedShopId.isEmpty) {
+        return shelf.Response(
+          400,
+          body: jsonEncode({
+            'error': 'shopId is required for shop users',
+            'code': 'MISSING_SHOP_ID',
+          }),
+        );
+      }
       return shelf.Response(
         401,
         body: jsonEncode({
@@ -1654,7 +1687,10 @@ class ServerApp {
     return {'token': token, 'user': session};
   }
 
-  Future<Map<String, dynamic>> _body(shelf.Request request) async {
+  Future<Map<String, dynamic>> _body(
+    shelf.Request request, {
+    bool rejectMalformed = false,
+  }) async {
     final body = await request.readAsString();
     if (body.trim().isEmpty) {
       return <String, dynamic>{};
@@ -1663,7 +1699,14 @@ class ServerApp {
       final decoded = jsonDecode(body);
       if (decoded is Map<String, dynamic>) return decoded;
       if (decoded is Map) return Map<String, dynamic>.from(decoded);
-    } catch (_) {}
+    } catch (_) {
+      if (rejectMalformed) {
+        throw const FormatException('Request body is not valid JSON');
+      }
+    }
+    if (rejectMalformed) {
+      throw const FormatException('Request body must be a JSON object');
+    }
     return <String, dynamic>{};
   }
 
