@@ -109,6 +109,78 @@ void main() {
     );
 
     test(
+      'grandfathers the shared legacy ID while enforcing modern device limits',
+      () async {
+        final db = _MemoryDatabase();
+        final store = DeviceStateStore(db);
+        await store.setDeviceLimit('shop-1', 1);
+        final legacy = await store.registerDevice(
+          shopId: 'shop-1',
+          userId: 'legacy-user',
+          deviceId: 'flutter-client',
+          deviceName: 'Legacy',
+          deviceType: 'legacy',
+        );
+        expect(legacy.allowed, isTrue);
+
+        final deviceA = await store.registerDevice(
+          shopId: 'shop-1',
+          userId: 'user-1',
+          deviceId: 'device-a',
+          deviceName: 'A',
+          deviceType: 'android',
+        );
+        expect(deviceA.allowed, isTrue);
+        expect(await store.activeDeviceCount('shop-1'), 1);
+
+        final repeatedDeviceA = await store.registerDevice(
+          shopId: 'shop-1',
+          userId: 'user-1',
+          deviceId: 'device-a',
+          deviceName: 'A',
+          deviceType: 'android',
+        );
+        expect(repeatedDeviceA.allowed, isTrue);
+
+        final deviceBAtLimit = await store.registerDevice(
+          shopId: 'shop-1',
+          userId: 'user-1',
+          deviceId: 'device-b',
+          deviceName: 'B',
+          deviceType: 'windows',
+        );
+        expect(deviceBAtLimit.allowed, isFalse);
+        expect(deviceBAtLimit.code, 'DEVICE_LIMIT_REACHED');
+
+        expect(await store.revokeDevice('shop-1', 'device-a'), isTrue);
+        final revokedDeviceA = await store.registerDevice(
+          shopId: 'shop-1',
+          userId: 'user-1',
+          deviceId: 'device-a',
+          deviceName: 'A',
+          deviceType: 'android',
+        );
+        expect(revokedDeviceA.allowed, isFalse);
+        expect(revokedDeviceA.code, 'DEVICE_REVOKED');
+
+        final deviceBAfterRevocation = await store.registerDevice(
+          shopId: 'shop-1',
+          userId: 'user-1',
+          deviceId: 'device-b',
+          deviceName: 'B',
+          deviceType: 'windows',
+        );
+        expect(deviceBAfterRevocation.allowed, isTrue);
+        expect(await store.activeDeviceCount('shop-1'), 1);
+        expect(
+          db.devices['shop-1:flutter-client']?['device_id'],
+          'flutter-client',
+        );
+        expect(db.devices['shop-1:flutter-client']?['user_id'], 'legacy-user');
+      },
+    );
+
+    test(
       'does not replace the existing device identity on repeated login',
       () async {
         final db = _MemoryDatabase();

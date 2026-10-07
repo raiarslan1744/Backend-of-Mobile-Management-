@@ -90,7 +90,13 @@ class DeviceStateStore {
       'SELECT device_id FROM devices WHERE shop_id = ?',
       [shopId],
     );
-    final deviceIds = rows.map((row) => row['device_id'].toString()).toList();
+    // The old client used one shared ID for every installation. Preserve its
+    // registration, but do not let that unidentifiable row consume a modern
+    // per-installation device slot.
+    final deviceIds = rows
+        .map((row) => row['device_id'].toString())
+        .where((deviceId) => deviceId != 'flutter-client')
+        .toList();
     final revoked = await revokedDeviceIds(shopId, deviceIds);
     return deviceIds.where((deviceId) => !revoked.contains(deviceId)).length;
   }

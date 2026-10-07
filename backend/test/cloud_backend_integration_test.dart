@@ -144,6 +144,11 @@ void main() {
       final firstToken =
           (jsonDecode(firstLogin.body) as Map<String, dynamic>)['authToken']
               as String;
+      final logout = await http.post(
+        Uri.parse('http://127.0.0.1:8080/api/auth/logout'),
+        headers: {'Authorization': 'Bearer $firstToken'},
+      );
+      expect(logout.statusCode, 200);
       final internalSyncDownload = await http.post(
         Uri.parse('http://127.0.0.1:8080/api/sync/download'),
         headers: {
@@ -160,14 +165,15 @@ void main() {
         isEmpty,
         reason: 'Device-limit state must not enter normal shop sync.',
       );
-      expect(
-        (await _loginShop(
-          shopId: limitOneShop,
-          username: 'limit-one-$stamp',
-          deviceId: 'limit-one-device-a',
-        )).statusCode,
-        200,
+      final repeatedLogin = await _loginShop(
+        shopId: limitOneShop,
+        username: 'limit-one-$stamp',
+        deviceId: 'limit-one-device-a',
       );
+      expect(repeatedLogin.statusCode, 200, reason: repeatedLogin.body);
+      final repeatedToken =
+          (jsonDecode(repeatedLogin.body) as Map<String, dynamic>)['authToken']
+              as String;
       final secondDevice = await _loginShop(
         shopId: limitOneShop,
         username: 'limit-one-$stamp',
@@ -219,7 +225,7 @@ void main() {
       expect(revoked.statusCode, 200, reason: revoked.body);
       final invalidatedSession = await http.get(
         Uri.parse('http://127.0.0.1:8080/api/sync/protocol'),
-        headers: {'Authorization': 'Bearer $firstToken'},
+        headers: {'Authorization': 'Bearer $repeatedToken'},
       );
       expect(invalidatedSession.statusCode, 401);
       final revokedLogin = await _loginShop(
