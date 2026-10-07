@@ -333,6 +333,7 @@ class ServerApp {
         username TEXT NOT NULL,
         password_hash TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'active',
+        device_limit INTEGER,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         license_start_date TEXT,
@@ -386,6 +387,10 @@ class ServerApp {
         imei TEXT,
         device_name TEXT,
         device_type TEXT,
+        ip_address TEXT,
+        is_revoked BOOLEAN NOT NULL DEFAULT FALSE,
+        revoked_at TEXT,
+        legacy_device_id TEXT,
         created_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL,
         UNIQUE(shop_id, device_id)
@@ -673,11 +678,24 @@ class ServerApp {
     await _ensureColumn('shops', 'license_start_date', 'TEXT');
     await _ensureColumn('shops', 'license_expiry_date', 'TEXT');
     await _ensureColumn('shops', 'license_assigned', 'BOOLEAN');
+    await _ensureColumn('shops', 'device_limit', 'INTEGER');
     await _ensureColumn(
       'shops',
       'is_lifetime',
       'BOOLEAN NOT NULL DEFAULT FALSE',
     );
+    await _ensureColumn(
+      'devices',
+      'ip_address',
+      'TEXT',
+    );
+    await _ensureColumn(
+      'devices',
+      'is_revoked',
+      'BOOLEAN NOT NULL DEFAULT FALSE',
+    );
+    await _ensureColumn('devices', 'revoked_at', 'TEXT');
+    await _ensureColumn('devices', 'legacy_device_id', 'TEXT');
   }
 
   Future<bool> _tableExists(String tableName) async {
@@ -711,6 +729,12 @@ class ServerApp {
     router.get('/api/health', _health);
     router.get('/api/super-admin/shops', _listShops);
     router.post('/api/super-admin/shops', _createShop);
+    router.put('/api/super-admin/shops/<shopId>', _updateShop);
+    router.get('/api/super-admin/shops/<shopId>/devices', _listShopDevices);
+    router.delete(
+      '/api/super-admin/shops/<shopId>/devices/<deviceId>',
+      _revokeDevice,
+    );
     router.post('/api/super-admin/shops/<shopId>/license', _renewShopLicense);
     router.delete('/api/super-admin/shops/<shopId>', _deleteShop);
     router.post('/api/shops', _createShop);
@@ -718,6 +742,8 @@ class ServerApp {
     router.post('/api/auth/logout', _logout);
     router.get('/api/auth/validate-shop-access', _validateShopAccess);
     router.post('/api/auth/register-device', _registerDevice);
+    router.get('/api/shop/profile', _getShopProfile);
+    router.put('/api/shop/profile', _updateShopProfile);
     router.post('/api/sync/upload', _uploadSync);
     router.get('/api/sync/protocol', (shelf.Request request) async {
       if (await _requireAuth(request) == null) return shelf.Response(401);
@@ -993,13 +1019,10 @@ class ServerApp {
 
   Future<shelf.Response> _createShop(shelf.Request request) async {
     final auth = await _requireAuth(request);
-    final isAuthorityRequest = request.url.pathSegments.contains('super-admin');
-    if (isAuthorityRequest && auth == null) {
+    if (auth == null) {
       return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
     }
-    if (isAuthorityRequest &&
-        auth != null &&
-        auth['user']['role'] != 'super_admin') {
+    if (auth['user']['role'] != 'super_admin') {
       return shelf.Response(
         403,
         body: jsonEncode({'error': 'Super admin authorization required'}),
@@ -1046,31 +1069,43 @@ class ServerApp {
         body: jsonEncode({'error': 'A valid assigned license is required'}),
       );
     }
+    final deviceLimit = body['deviceLimit'];
+    if (deviceLimit is! int || deviceLimit < 1 || deviceLimit > 1000) {
+      return shelf.Response(
+        400,
+        body: jsonEncode({
+          'error': 'deviceLimit must be an integer between 1 and 1000.',
+        }),
+      );
+    }
     try {
-      await db.execute(
-        'INSERT INTO shops (shop_id, owner_name, contact, address, username, password_hash, status, license_start_date, license_expiry_date, is_lifetime, license_assigned, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        [
-          shopId,
-          (body['ownerName'] ?? 'Shop Owner').toString(),
-          (body['contact'] ?? '').toString(),
-          (body['address'] ?? '').toString(),
-          username,
-          resolvedHash,
-          body['status']?.toString() == 'suspended' ? 'suspended' : 'active',
-          licenseStartDate,
-          licenseExpiryDate,
-          isLifetime,
-          body['licenseAssigned'] == true ? true : null,
-          now,
-          now,
-        ],
-      );
+      await db.syncTransaction(() async {
+        await db.execute(
+          'INSERT INTO shops (shop_id, owner_name, contact, address, username, password_hash, status, device_limit, license_start_date, license_expiry_date, is_lifetime, license_assigned, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            shopId,
+            (body['ownerName'] ?? 'Shop Owner').toString(),
+            (body['contact'] ?? '').toString(),
+            (body['address'] ?? '').toString(),
+            username,
+            resolvedHash,
+            body['status']?.toString() == 'suspended' ? 'suspended' : 'active',
+            deviceLimit,
+            licenseStartDate,
+            licenseExpiryDate,
+            isLifetime,
+            body['licenseAssigned'] == true ? true : null,
+            now,
+            now,
+          ],
+        );
 
-      final userId = const Uuid().v4();
-      await db.execute(
-        'INSERT OR IGNORE INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [userId, username, resolvedHash, shopId, 'admin', now, now],
-      );
+        final userId = const Uuid().v4();
+        await db.execute(
+          'INSERT INTO users (id, username, password_hash, shop_id, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [userId, username, resolvedHash, shopId, 'admin', now, now],
+        );
+      });
 
       print('CREATE SHOP FINAL RESULT shopId=$shopId success=true');
       return shelf.Response.ok(
@@ -1083,6 +1118,7 @@ class ServerApp {
           'licenseExpiryDate': licenseExpiryDate,
           'isLifetime': isLifetime,
           'licenseAssigned': true,
+          'deviceLimit': deviceLimit,
         }),
       );
     } catch (error, stackTrace) {
@@ -1125,32 +1161,368 @@ class ServerApp {
         );
       }
     }
+    final shops = <Map<String, Object?>>[];
+    for (final row in rows) {
+      final activeCount = await _activeDeviceCount(
+        row['shop_id'].toString(),
+      );
+      final rawLimit = row['device_limit'];
+      final deviceLimit = rawLimit is int
+          ? rawLimit
+          : int.tryParse(rawLimit?.toString() ?? '');
+      shops.add({
+        'shopId': row['shop_id'],
+        'ownerName': row['owner_name'],
+        'contact': row['contact'],
+        'address': row['address'],
+        'username': row['username'],
+        'createdAt': row['created_at'],
+        'updatedAt': row['updated_at'],
+        'status': row['status'],
+        'licenseStartDate': row['license_start_date'],
+        'licenseExpiryDate': row['license_expiry_date'],
+        'isLifetime': row['is_lifetime'] == true || row['is_lifetime'] == 1,
+        'licenseAssigned':
+            row['license_assigned'] == true || row['license_assigned'] == 1,
+        'deviceLimit': row['device_limit'],
+        'registeredDeviceCount': activeCount,
+        'overDeviceLimit': deviceLimit != null && activeCount > deviceLimit,
+      });
+    }
+    return shelf.Response.ok(jsonEncode(shops));
+  }
+
+  Future<shelf.Response> _updateShop(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null || auth['user']['role'] != 'super_admin') {
+      return shelf.Response(
+        auth == null ? 401 : 403,
+        body: jsonEncode({'error': 'Super admin authorization required'}),
+      );
+    }
+    final shopId = request.params['shopId']?.trim() ?? '';
+    final body = await _body(request, rejectMalformed: true);
+    final ownerName = body['ownerName'];
+    final contact = body['contact'];
+    final address = body['address'];
+    final username = body['username'];
+    final password = body['password'];
+    final hasDeviceLimit = body.containsKey('deviceLimit');
+    final deviceLimit = body['deviceLimit'];
+    if (shopId.isEmpty ||
+        ownerName is! String ||
+        ownerName.trim().isEmpty ||
+        contact is! String ||
+        address is! String ||
+        username is! String ||
+        username.trim().isEmpty ||
+        username.trim().length > 128 ||
+        (password != null &&
+            (password is! String ||
+                (password.isNotEmpty && password.length < 8) ||
+                password.length > 128)) ||
+        (hasDeviceLimit &&
+            deviceLimit != null &&
+            (deviceLimit is! int ||
+                deviceLimit < 1 ||
+                deviceLimit > 1000))) {
+      return shelf.Response(
+        400,
+        body: jsonEncode({'error': 'Shop fields are invalid.'}),
+      );
+    }
+
+    final result = await db.syncTransaction(() async {
+      final shopRows = await db.select(
+        'SELECT shop_id, username FROM shops WHERE shop_id = ? FOR UPDATE',
+        [shopId],
+      );
+      if (shopRows.isEmpty) return 'SHOP_NOT_FOUND';
+
+      final oldUsername = shopRows.first['username']?.toString() ?? '';
+      final adminRows = await db.select(
+        "SELECT id, username FROM users WHERE shop_id = ? AND role = 'admin' ORDER BY created_at FOR UPDATE",
+        [shopId],
+      );
+      final matchingAdmins = adminRows
+          .where((row) => row['username']?.toString() == oldUsername)
+          .toList(growable: false);
+      final userRows = matchingAdmins.length == 1
+          ? matchingAdmins
+          : matchingAdmins.isEmpty && adminRows.length == 1
+          ? adminRows
+          : const <Map<String, Object?>>[];
+      if (userRows.isEmpty) return 'ADMIN_USER_NOT_FOUND';
+      final userId = userRows.single['id'];
+      final duplicate = await db.select(
+        'SELECT id FROM users WHERE shop_id = ? AND username = ? AND id <> ?',
+        [shopId, username.trim(), userId],
+      );
+      final employeeDuplicate = await db.select(
+        "SELECT id FROM employees WHERE shop_id = ? AND username = ? AND status = 'active' AND is_deleted = 0",
+        [shopId, username.trim()],
+      );
+      if (duplicate.isNotEmpty || employeeDuplicate.isNotEmpty) {
+        return 'USERNAME_TAKEN';
+      }
+
+      final passwordHash = password is String && password.isNotEmpty
+          ? hashPassword(password)
+          : null;
+      final now = utcNow();
+      await db.execute(
+        hasDeviceLimit
+            ? 'UPDATE shops SET owner_name = ?, contact = ?, address = ?, username = ?, device_limit = ?, updated_at = ? WHERE shop_id = ?'
+            : 'UPDATE shops SET owner_name = ?, contact = ?, address = ?, username = ?, updated_at = ? WHERE shop_id = ?',
+        hasDeviceLimit
+            ? [
+                ownerName.trim(),
+                contact.trim(),
+                address.trim(),
+                username.trim(),
+                deviceLimit,
+                now,
+                shopId,
+              ]
+            : [
+                ownerName.trim(),
+                contact.trim(),
+                address.trim(),
+                username.trim(),
+                now,
+                shopId,
+              ],
+      );
+      await db.execute(
+        passwordHash == null
+            ? 'UPDATE users SET username = ?, updated_at = ? WHERE id = ?'
+            : 'UPDATE users SET username = ?, password_hash = ?, updated_at = ? WHERE id = ?',
+        passwordHash == null
+            ? [username.trim(), now, userId]
+            : [username.trim(), passwordHash, now, userId],
+      );
+      return null;
+    });
+
+    if (result == 'SHOP_NOT_FOUND') {
+      return shelf.Response(404, body: jsonEncode({'error': 'Shop not found.'}));
+    }
+    if (result == 'USERNAME_TAKEN') {
+      return shelf.Response(
+        409,
+        body: jsonEncode({'error': 'That shop username is already in use.'}),
+      );
+    }
+    if (result == 'ADMIN_USER_NOT_FOUND') {
+      return shelf.Response(
+        500,
+        body: jsonEncode({'error': 'Shop admin account is unavailable.'}),
+      );
+    }
+    if (result != null) {
+      return shelf.Response(
+        500,
+        body: jsonEncode({'error': 'Shop admin account is unavailable.'}),
+      );
+    }
+    final rows = await db.select('SELECT * FROM shops WHERE shop_id = ?', [
+      shopId,
+    ]);
+    return shelf.Response.ok(jsonEncode(_publicShop(rows.single)));
+  }
+
+  Map<String, Object?> _publicShop(Map<String, Object?> row) => {
+    'shopId': row['shop_id'],
+    'ownerName': row['owner_name'],
+    'contact': row['contact'],
+    'address': row['address'],
+    'username': row['username'],
+    'status': row['status'],
+    'createdAt': row['created_at'],
+    'updatedAt': row['updated_at'],
+    'licenseStartDate': row['license_start_date'],
+    'licenseExpiryDate': row['license_expiry_date'],
+    'isLifetime': row['is_lifetime'] == true || row['is_lifetime'] == 1,
+    'licenseAssigned':
+        row['license_assigned'] == true || row['license_assigned'] == 1,
+    'deviceLimit': row['device_limit'],
+  };
+
+  Future<int> _activeDeviceCount(String shopId) async {
+    final rows = await db.select(
+      'SELECT COUNT(*) AS active_count FROM devices WHERE shop_id = ? AND is_revoked = FALSE',
+      [shopId],
+    );
+    return int.tryParse(rows.first['active_count']?.toString() ?? '') ?? 0;
+  }
+
+  Future<shelf.Response> _listShopDevices(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null || auth['user']['role'] != 'super_admin') {
+      return shelf.Response(
+        auth == null ? 401 : 403,
+        body: jsonEncode({'error': 'Super admin authorization required'}),
+      );
+    }
+    final shopId = request.params['shopId']?.trim() ?? '';
+    final shopRows = await db.select(
+      'SELECT device_limit FROM shops WHERE shop_id = ?',
+      [shopId],
+    );
+    if (shopRows.isEmpty) {
+      return shelf.Response(404, body: jsonEncode({'error': 'Shop not found.'}));
+    }
+    final rows = await db.select(
+      'SELECT device_id, device_name, device_type, ip_address, created_at, last_seen_at, is_revoked, legacy_device_id FROM devices WHERE shop_id = ? ORDER BY created_at',
+      [shopId],
+    );
+    final deviceLimitRaw = shopRows.first['device_limit'];
+    final deviceLimit = deviceLimitRaw is int
+        ? deviceLimitRaw
+        : int.tryParse(deviceLimitRaw?.toString() ?? '');
+    final activeCount = await _activeDeviceCount(shopId);
+    final devices = rows
+        .map(
+          (row) => {
+            'deviceId': row['device_id'],
+            'deviceName': row['device_name'],
+            'platform': row['device_type'],
+            'ipAddress': row['ip_address'],
+            'firstRegistered': row['created_at'],
+            'lastSeen': row['last_seen_at'],
+            'isLegacy':
+                row['device_id'] == 'flutter-client' ||
+                row['legacy_device_id'] != null,
+            'status': row['is_revoked'] == true || row['is_revoked'] == 1
+                ? 'revoked'
+                : row['device_id'] == 'flutter-client' ||
+                      row['legacy_device_id'] != null
+                ? 'legacy'
+                : 'active',
+          },
+        )
+        .toList(growable: false);
     return shelf.Response.ok(
-      jsonEncode(
-        rows
-            .map(
-              (row) => {
-                'shopId': row['shop_id'],
-                'ownerName': row['owner_name'],
-                'contact': row['contact'],
-                'address': row['address'],
-                'username': row['username'],
-                'createdAt': row['created_at'],
-                'updatedAt': row['updated_at'],
-                'status': row['status'],
-                'licenseStartDate': row['license_start_date'],
-                'licenseExpiryDate': row['license_expiry_date'],
-                'isLifetime':
-                    row['is_lifetime'] == true || row['is_lifetime'] == 1,
-                'licenseAssigned':
-                    row['license_assigned'] == true ||
-                    row['license_assigned'] == 1,
-              },
-            )
-            .toList(),
-      ),
+      jsonEncode({
+        'shopId': shopId,
+        'deviceLimit': shopRows.first['device_limit'],
+        'registeredDeviceCount': activeCount,
+        'overDeviceLimit':
+            deviceLimit != null && activeCount > deviceLimit,
+        'devices': devices,
+      }),
     );
   }
+
+  Future<shelf.Response> _revokeDevice(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null || auth['user']['role'] != 'super_admin') {
+      return shelf.Response(
+        auth == null ? 401 : 403,
+        body: jsonEncode({'error': 'Super admin authorization required'}),
+      );
+    }
+    final shopId = request.params['shopId']?.trim() ?? '';
+    final deviceId = request.params['deviceId']?.trim() ?? '';
+    if (shopId.isEmpty || deviceId.isEmpty) {
+      return shelf.Response(400, body: jsonEncode({'error': 'Invalid device.'}));
+    }
+    final found = await db.syncTransaction(() async {
+      final rows = await db.select(
+        'SELECT id FROM devices WHERE shop_id = ? AND device_id = ? FOR UPDATE',
+        [shopId, deviceId],
+      );
+      if (rows.isEmpty) return false;
+      await db.execute(
+        'UPDATE devices SET is_revoked = TRUE, revoked_at = ? WHERE shop_id = ? AND device_id = ?',
+        [utcNow(), shopId, deviceId],
+      );
+      await db.execute(
+        'DELETE FROM sessions WHERE device_id = ? AND user_id IN (SELECT id FROM users WHERE shop_id = ? UNION SELECT id FROM employees WHERE shop_id = ?)',
+        [deviceId, shopId, shopId],
+      );
+      return true;
+    });
+    if (!found) {
+      return shelf.Response(404, body: jsonEncode({'error': 'Device not found.'}));
+    }
+    return shelf.Response.ok(
+      jsonEncode({
+        'success': true,
+        'deviceId': deviceId,
+        'registeredDeviceCount': await _activeDeviceCount(shopId),
+      }),
+    );
+  }
+
+  Future<shelf.Response> _getShopProfile(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null || auth['user']['role'] != 'admin') {
+      return shelf.Response(
+        auth == null ? 401 : 403,
+        body: jsonEncode({'error': 'Shop user authorization required'}),
+      );
+    }
+    final rows = await db.select(
+      'SELECT shop_id, owner_name, address, contact, updated_at FROM shops WHERE shop_id = ?',
+      [auth['user']['shop_id']],
+    );
+    if (rows.isEmpty) {
+      return shelf.Response(404, body: jsonEncode({'error': 'Shop not found.'}));
+    }
+    return shelf.Response.ok(jsonEncode(_shopProfile(rows.single)));
+  }
+
+  Future<shelf.Response> _updateShopProfile(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null || auth['user']['role'] != 'admin') {
+      return shelf.Response(
+        auth == null ? 401 : 403,
+        body: jsonEncode({'error': 'Shop admin authorization required'}),
+      );
+    }
+    final body = await _body(request, rejectMalformed: true);
+    final name = body['name'];
+    final address = body['address'];
+    final phone = body['phone'];
+    if (name is! String ||
+        name.trim().isEmpty ||
+        address is! String ||
+        address.trim().isEmpty ||
+        phone is! String ||
+        phone.trim().isEmpty ||
+        name.length > 200 ||
+        address.length > 500 ||
+        phone.length > 64) {
+      return shelf.Response(
+        400,
+        body: jsonEncode({'error': 'Shop profile fields are invalid.'}),
+      );
+    }
+    final shopId = auth['user']['shop_id'] as String;
+    await db.syncTransaction(() async {
+      await db.execute(
+        'UPDATE shops SET owner_name = ?, address = ?, contact = ?, updated_at = ? WHERE shop_id = ?',
+        [name.trim(), address.trim(), phone.trim(), utcNow(), shopId],
+      );
+    });
+    final rows = await db.select(
+      'SELECT shop_id, owner_name, address, contact, updated_at FROM shops WHERE shop_id = ?',
+      [shopId],
+    );
+    if (rows.isEmpty) {
+      return shelf.Response(404, body: jsonEncode({'error': 'Shop not found.'}));
+    }
+    return shelf.Response.ok(jsonEncode(_shopProfile(rows.single)));
+  }
+
+  Map<String, Object?> _shopProfile(Map<String, Object?> row) => {
+    'shopId': row['shop_id'],
+    'name': row['owner_name'],
+    'address': row['address'],
+    'phone': row['contact'],
+    'updatedAt': row['updated_at'],
+  };
 
   Future<shelf.Response> _renewShopLicense(shelf.Request request) async {
     final auth = await _requireAuth(request);
@@ -1222,7 +1594,10 @@ class ServerApp {
     final username = body['username']?.toString().trim() ?? '';
     final suppliedShopId = body['shopId']?.toString().trim() ?? '';
     final password = body['password']?.toString() ?? '';
-    final deviceId = body['deviceId']?.toString() ?? 'unknown-device';
+    final deviceId = body['deviceId']?.toString().trim() ?? 'flutter-client';
+    final deviceName = body['deviceName']?.toString().trim() ?? 'Qodra POS';
+    final deviceType =
+        body['deviceType']?.toString().trim() ?? 'unknown';
     if (username.isEmpty || password.isEmpty) {
       return shelf.Response(
         400,
@@ -1230,6 +1605,17 @@ class ServerApp {
           'error': 'username and password are required',
           'code': 'MISSING_CREDENTIALS',
         }),
+      );
+    }
+    if (deviceId.isEmpty ||
+        deviceId.length > 256 ||
+        deviceName.isEmpty ||
+        deviceName.length > 200 ||
+        deviceType.isEmpty ||
+        deviceType.length > 64) {
+      return shelf.Response(
+        400,
+        body: jsonEncode({'error': 'Device information is invalid.'}),
       );
     }
     final passwordHash = hashPassword(password);
@@ -1304,7 +1690,7 @@ class ServerApp {
     Map<String, Object?>? shopInfo;
     if (role != 'super_admin') {
       final shopRows = await db.select(
-        'SELECT status, license_assigned, license_expiry_date, is_lifetime FROM shops WHERE shop_id = ?',
+        'SELECT shop_id, owner_name, contact, address, status, license_assigned, license_start_date, license_expiry_date, is_lifetime, device_limit, updated_at FROM shops WHERE shop_id = ?',
         [shopId],
       );
       if (shopRows.isNotEmpty) {
@@ -1330,8 +1716,10 @@ class ServerApp {
           return shelf.Response(
             403,
             body: jsonEncode({
-              'error': 'Your shop license has expired. Please contact the administrator to renew your license.',
-              'code': 'SHOP_LICENSE_EXPIRED',
+              'error': expired
+                  ? 'Your shop license has expired. Please contact the administrator to renew your license.'
+                  : 'This shop is inactive. Please contact the Super Admin.',
+              'code': expired ? 'SHOP_LICENSE_EXPIRED' : 'SHOP_INACTIVE',
             }),
           );
         }
@@ -1355,17 +1743,40 @@ class ServerApp {
         .toUtc()
         .add(const Duration(hours: 24))
         .toIso8601String();
-    await db.execute(
-      'INSERT INTO sessions (id, user_id, token, device_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [
-        const Uuid().v4(),
-        user['id'] as String,
-        token,
-        deviceId,
-        expiresAt,
-        now,
-      ],
-    );
+    final registration = await db.syncTransaction(() async {
+      if (role != 'super_admin') {
+        final registered = await _registerLoginDevice(
+          shopId: shopId,
+          userId: user['id'].toString(),
+          deviceId: deviceId,
+          deviceName: deviceName,
+          deviceType: deviceType,
+          ipAddress: _clientIpAddress(request),
+        );
+        if (!registered.allowed) return registered;
+      }
+      await db.execute(
+        'INSERT INTO sessions (id, user_id, token, device_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        [
+          const Uuid().v4(),
+          user['id'] as String,
+          token,
+          deviceId,
+          expiresAt,
+          now,
+        ],
+      );
+      return (allowed: true, code: null, message: null);
+    });
+    if (!registration.allowed) {
+      return shelf.Response(
+        403,
+        body: jsonEncode({
+          'error': registration.message ?? 'Device registration is blocked.',
+          'code': registration.code ?? 'DEVICE_REGISTRATION_BLOCKED',
+        }),
+      );
+    }
     final sessionPayload = {
       'userId': user['id'],
       'username': user['username'],
@@ -1387,29 +1798,110 @@ class ServerApp {
           shopInfo['license_start_date'] != null ||
           shopInfo['license_expiry_date'] != null ||
           sessionPayload['isLifetime'] == true;
-    }
-
-    try {
-      await db.execute(
-        'INSERT INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (shop_id, device_id) DO UPDATE SET user_id = EXCLUDED.user_id, imei = EXCLUDED.imei, device_name = EXCLUDED.device_name, device_type = EXCLUDED.device_type, last_seen_at = EXCLUDED.last_seen_at',
-        [
-          const Uuid().v4(),
-          user['id'].toString(),
-          shopId,
-          deviceId,
-          deviceId,
-          'Flutter Client',
-          'windows',
-          now,
-          now,
-        ],
-      );
-    } catch (error) {
-      print('Auth login device-write exception type=${error.runtimeType}');
-      rethrow;
+      sessionPayload['deviceLimit'] = shopInfo['device_limit'];
+      sessionPayload['shopProfile'] = _shopProfile(shopInfo);
     }
 
     return shelf.Response.ok(jsonEncode(sessionPayload));
+  }
+
+  String _clientIpAddress(shelf.Request request) {
+    final forwarded = request.headers['x-forwarded-for'];
+    if (forwarded != null && forwarded.trim().isNotEmpty) {
+      return forwarded.split(',').first.trim();
+    }
+    final realIp = request.headers['x-real-ip'];
+    return realIp != null && realIp.trim().isNotEmpty
+        ? realIp.trim()
+        : 'unknown';
+  }
+
+  Future<({bool allowed, String? code, String? message})> _registerLoginDevice({
+    required String shopId,
+    required String userId,
+    required String deviceId,
+    required String deviceName,
+    required String deviceType,
+    required String ipAddress,
+  }) async {
+    final shops = await db.select(
+      'SELECT device_limit FROM shops WHERE shop_id = ? FOR UPDATE',
+      [shopId],
+    );
+    if (shops.isEmpty) {
+      return (
+        allowed: false,
+        code: 'SHOP_NOT_FOUND',
+        message: 'Shop not found.',
+      );
+    }
+    final rawLimit = shops.single['device_limit'];
+    final deviceLimit = rawLimit is int
+        ? rawLimit
+        : int.tryParse(rawLimit?.toString() ?? '');
+
+    var existing = await db.select(
+      'SELECT is_revoked FROM devices WHERE shop_id = ? AND device_id = ?',
+      [shopId, deviceId],
+    );
+    if (existing.isNotEmpty) {
+      if (existing.single['is_revoked'] == true ||
+          existing.single['is_revoked'] == 1) {
+        return (
+          allowed: false,
+          code: 'DEVICE_REVOKED',
+          message:
+              'This device was revoked. Ask the Super Admin to authorize a replacement device.',
+        );
+      }
+      await db.execute(
+        'UPDATE devices SET user_id = ?, device_name = ?, device_type = ?, ip_address = ?, last_seen_at = ? WHERE shop_id = ? AND device_id = ?',
+        [
+          userId,
+          deviceName,
+          deviceType,
+          ipAddress,
+          utcNow(),
+          shopId,
+          deviceId,
+        ],
+      );
+      return (allowed: true, code: null, message: null);
+    }
+
+    if (deviceLimit != null) {
+      final countRows = await db.select(
+        'SELECT COUNT(*) AS active_count FROM devices WHERE shop_id = ? AND is_revoked = FALSE',
+        [shopId],
+      );
+      final activeCount =
+          int.tryParse(countRows.first['active_count']?.toString() ?? '') ?? 0;
+      if (activeCount >= deviceLimit) {
+        return (
+          allowed: false,
+          code: 'DEVICE_LIMIT_REACHED',
+          message:
+              'Device limit reached for this shop. Ask the Super Admin to remove a registered device or increase the device limit.',
+        );
+      }
+    }
+
+    final now = utcNow();
+    await db.execute(
+      'INSERT INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, ip_address, is_revoked, revoked_at, legacy_device_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, FALSE, NULL, NULL, ?, ?)',
+      [
+        const Uuid().v4(),
+        userId,
+        shopId,
+        deviceId,
+        deviceName,
+        deviceType,
+        ipAddress,
+        now,
+        now,
+      ],
+    );
+    return (allowed: true, code: null, message: null);
   }
 
   Future<shelf.Response> _logout(shelf.Request request) async {
@@ -1442,24 +1934,43 @@ class ServerApp {
       return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
     }
     final body = await _body(request);
-    final deviceId = body['deviceId']?.toString() ?? '';
+    final deviceId = body['deviceId']?.toString().trim() ?? '';
+    final sessionDeviceId = auth['user']['device_id']?.toString() ?? '';
+    if (auth['user']['role'] == 'super_admin' ||
+        deviceId.isEmpty ||
+        deviceId.length > 256 ||
+        deviceId != sessionDeviceId) {
+      return shelf.Response(
+        403,
+        body: jsonEncode({
+          'error': 'A session may register only its authenticated device.',
+          'code': 'DEVICE_MISMATCH',
+        }),
+      );
+    }
     final shopId = auth['user']['shop_id'] as String;
     final userId = auth['user']['id'] as String;
-    final now = utcNow();
-    await db.execute(
-      'INSERT OR REPLACE INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [
-        const Uuid().v4(),
-        userId,
-        shopId,
-        deviceId,
-        body['imei']?.toString() ?? deviceId,
-        body['deviceName']?.toString() ?? 'Flutter Client',
-        body['deviceType']?.toString() ?? 'windows',
-        now,
-        now,
-      ],
+    final deviceName = body['deviceName']?.toString().trim() ?? 'Qodra POS';
+    final deviceType = body['deviceType']?.toString().trim() ?? 'unknown';
+    final result = await db.syncTransaction(
+      () => _registerLoginDevice(
+        shopId: shopId,
+        userId: userId,
+        deviceId: deviceId,
+        deviceName: deviceName,
+        deviceType: deviceType,
+        ipAddress: _clientIpAddress(request),
+      ),
     );
+    if (!result.allowed) {
+      return shelf.Response(
+        403,
+        body: jsonEncode({
+          'error': result.message ?? 'Device registration is blocked.',
+          'code': result.code ?? 'DEVICE_REGISTRATION_BLOCKED',
+        }),
+      );
+    }
     return shelf.Response.ok(
       jsonEncode({'registered': true, 'deviceId': deviceId}),
     );
@@ -1661,6 +2172,21 @@ class ServerApp {
     if (DateTime.parse(expiresAt).isBefore(DateTime.now().toUtc())) {
       await db.execute('DELETE FROM sessions WHERE token = ?', [token]);
       return null;
+    }
+    if (session['role'] != 'super_admin') {
+      final device = await db.select(
+        'SELECT is_revoked FROM devices WHERE shop_id = ? AND device_id = ?',
+        [session['shop_id'], session['device_id']],
+      );
+      // Older shared-ID sessions may predate device-row registration.
+      final legacySessionWithoutRegistration =
+          device.isEmpty && session['device_id'] == 'flutter-client';
+      if (!legacySessionWithoutRegistration &&
+          (device.isEmpty ||
+              device.single['is_revoked'] == true ||
+              device.single['is_revoked'] == 1)) {
+        return null;
+      }
     }
     if (session['role'] == 'employee') {
       final employee = await db.select(
