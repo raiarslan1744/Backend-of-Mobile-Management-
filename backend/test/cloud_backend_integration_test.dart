@@ -144,6 +144,22 @@ void main() {
       final firstToken =
           (jsonDecode(firstLogin.body) as Map<String, dynamic>)['authToken']
               as String;
+      final internalSyncDownload = await http.post(
+        Uri.parse('http://127.0.0.1:8080/api/sync/download'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $firstToken',
+        },
+        body: jsonEncode({'batchSize': 500}),
+      );
+      expect(internalSyncDownload.statusCode, 200);
+      expect(
+        (jsonDecode(internalSyncDownload.body) as Map<String, dynamic>)[
+          'changes'
+        ],
+        isEmpty,
+        reason: 'Device-limit state must not enter normal shop sync.',
+      );
       expect(
         (await _loginShop(
           shopId: limitOneShop,
@@ -319,7 +335,7 @@ void main() {
       final legacyHash = hashPassword('legacy-password-123');
       final now = DateTime.now().toUtc().toIso8601String();
       await server.db.execute(
-        'INSERT INTO shops (shop_id, owner_name, contact, address, username, password_hash, status, device_limit, license_start_date, license_expiry_date, is_lifetime, license_assigned, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, TRUE, TRUE, ?, ?)',
+        'INSERT INTO shops (shop_id, owner_name, contact, address, username, password_hash, status, license_start_date, license_expiry_date, is_lifetime, license_assigned, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, TRUE, TRUE, ?, ?)',
         [
           nullLimitShop,
           'Legacy owner',
@@ -346,14 +362,18 @@ void main() {
         ],
       );
       for (final deviceId in ['null-limit-a', 'null-limit-b']) {
+        final nullLimitLogin = await _loginShop(
+          shopId: nullLimitShop,
+          username: 'null-limit-$stamp',
+          password: 'legacy-password-123',
+          deviceId: deviceId,
+        );
+        expect(nullLimitLogin.statusCode, 200);
         expect(
-          (await _loginShop(
-            shopId: nullLimitShop,
-            username: 'null-limit-$stamp',
-            password: 'legacy-password-123',
-            deviceId: deviceId,
-          )).statusCode,
-          200,
+          (jsonDecode(nullLimitLogin.body) as Map<String, dynamic>)[
+            'deviceLimit'
+          ],
+          isNull,
         );
       }
 

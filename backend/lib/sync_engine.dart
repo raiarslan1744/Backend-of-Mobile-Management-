@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
+import 'package:uuid/uuid.dart';
 
 abstract interface class SyncDatabase {
   Future<List<Map<String, Object?>>> select(
@@ -10,6 +11,192 @@ abstract interface class SyncDatabase {
   Future<void> execute(String sql, [List<Object?> parameters = const []]);
   Future<T> syncTransaction<T>(Future<T> Function() action);
   Future<Map<String, String>> columns(String table);
+}
+
+const internalDeviceLimitEntityType = '_qodra_device_limit';
+const internalDeviceRevocationEntityType = '_qodra_device_revocation';
+
+class DeviceStateStore {
+  DeviceStateStore(this.db);
+
+  final SyncDatabase db;
+
+  String _encodeKey(String value) =>
+      base64Url.encode(utf8.encode(value)).replaceAll('=', '');
+
+  String _limitRecordId(String shopId) =>
+      'qodra-device-limit:${_encodeKey(shopId)}';
+
+  String _revocationRecordId(String shopId, String deviceId) =>
+      'qodra-device-revocation:${_encodeKey(shopId)}:${_encodeKey(deviceId)}';
+
+  Future<int?> deviceLimit(String shopId) async {
+    final rows = await db.select(
+      'SELECT data FROM sync_records WHERE id = ? AND shop_id = ?',
+      [_limitRecordId(shopId), shopId],
+    );
+    if (rows.isEmpty) return null;
+    final data = jsonDecode(rows.single['data'] as String);
+    if (data is! Map || data['limit'] is! int) {
+      throw StateError(
+        'Stored device-limit state is invalid for shop $shopId.',
+      );
+    }
+    return data['limit'] as int;
+  }
+
+  Future<void> setDeviceLimit(String shopId, int? limit) async {
+    if (limit != null && (limit < 1 || limit > 1000)) {
+      throw ArgumentError.value(limit, 'limit', 'Must be between 1 and 1000.');
+    }
+    final recordId = _limitRecordId(shopId);
+    if (limit == null) {
+      await db.execute(
+        'DELETE FROM sync_records WHERE id = ? AND shop_id = ?',
+        [recordId, shopId],
+      );
+      return;
+    }
+    await _writeInternalRecord(
+      id: recordId,
+      shopId: shopId,
+      entityType: internalDeviceLimitEntityType,
+      entityId: 'device-limit',
+      data: {'limit': limit},
+    );
+  }
+
+  Future<bool> isDeviceRevoked(String shopId, String deviceId) async {
+    final rows = await db.select(
+      'SELECT id FROM sync_records WHERE id = ? AND shop_id = ?',
+      [_revocationRecordId(shopId, deviceId), shopId],
+    );
+    return rows.isNotEmpty;
+  }
+
+  Future<Set<String>> revokedDeviceIds(
+    String shopId,
+    Iterable<String> deviceIds,
+  ) async {
+    final revoked = <String>{};
+    for (final deviceId in deviceIds) {
+      if (await isDeviceRevoked(shopId, deviceId)) revoked.add(deviceId);
+    }
+    return revoked;
+  }
+
+  Future<int> activeDeviceCount(String shopId) async {
+    final rows = await db.select(
+      'SELECT device_id FROM devices WHERE shop_id = ?',
+      [shopId],
+    );
+    final deviceIds = rows.map((row) => row['device_id'].toString()).toList();
+    final revoked = await revokedDeviceIds(shopId, deviceIds);
+    return deviceIds.where((deviceId) => !revoked.contains(deviceId)).length;
+  }
+
+  Future<({bool allowed, String? code, String? message})> registerDevice({
+    required String shopId,
+    required String userId,
+    required String deviceId,
+    required String deviceName,
+    required String deviceType,
+  }) async {
+    final shops = await db.select(
+      'SELECT shop_id FROM shops WHERE shop_id = ?',
+      [shopId],
+    );
+    if (shops.isEmpty) {
+      return (
+        allowed: false,
+        code: 'SHOP_NOT_FOUND',
+        message: 'Shop not found.',
+      );
+    }
+    if (await isDeviceRevoked(shopId, deviceId)) {
+      return (
+        allowed: false,
+        code: 'DEVICE_REVOKED',
+        message: 'This device was revoked. Ask the Super Admin to authorize a replacement device.',
+      );
+    }
+
+    final existing = await db.select(
+      'SELECT id FROM devices WHERE shop_id = ? AND device_id = ?',
+      [shopId, deviceId],
+    );
+    if (existing.isNotEmpty) {
+      await db.execute(
+        'UPDATE devices SET device_name = ?, device_type = ?, last_seen_at = ? WHERE shop_id = ? AND device_id = ?',
+        [
+          deviceName,
+          deviceType,
+          DateTime.now().toUtc().toIso8601String(),
+          shopId,
+          deviceId,
+        ],
+      );
+      return (allowed: true, code: null, message: null);
+    }
+
+    final limit = await deviceLimit(shopId);
+    if (limit != null && await activeDeviceCount(shopId) >= limit) {
+      return (
+        allowed: false,
+        code: 'DEVICE_LIMIT_REACHED',
+        message: 'Device limit reached for this shop. Ask the Super Admin to remove a registered device or increase the device limit.',
+      );
+    }
+
+    final now = DateTime.now().toUtc().toIso8601String();
+    await db.execute(
+      'INSERT INTO devices (id, user_id, shop_id, device_id, imei, device_name, device_type, created_at, last_seen_at) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)',
+      [
+        const Uuid().v4(),
+        userId,
+        shopId,
+        deviceId,
+        deviceName,
+        deviceType,
+        now,
+        now,
+      ],
+    );
+    return (allowed: true, code: null, message: null);
+  }
+
+  Future<bool> revokeDevice(String shopId, String deviceId) async {
+    final rows = await db.select(
+      'SELECT id FROM devices WHERE shop_id = ? AND device_id = ?',
+      [shopId, deviceId],
+    );
+    if (rows.isEmpty) return false;
+    await _writeInternalRecord(
+      id: _revocationRecordId(shopId, deviceId),
+      shopId: shopId,
+      entityType: internalDeviceRevocationEntityType,
+      entityId: deviceId,
+      data: {
+        'deviceId': deviceId,
+        'revokedAt': DateTime.now().toUtc().toIso8601String(),
+      },
+    );
+    return true;
+  }
+
+  Future<void> _writeInternalRecord({
+    required String id,
+    required String shopId,
+    required String entityType,
+    required String entityId,
+    required Map<String, Object?> data,
+  }) async {
+    final now = DateTime.now().toUtc().toIso8601String();
+    await db.execute(
+      'INSERT INTO sync_records (id, shop_id, entity_type, entity_id, operation, data, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0) ON CONFLICT (id) DO UPDATE SET operation = EXCLUDED.operation, data = EXCLUDED.data, updated_at = EXCLUDED.updated_at, is_deleted = 0',
+      [id, shopId, entityType, entityId, 'update', jsonEncode(data), now, now],
+    );
+  }
 }
 
 const syncTables = <String, String>{
@@ -361,8 +548,17 @@ class SyncEngine {
     }
     limit = limit.clamp(1, 500);
     final rows = await db.select(
-      'SELECT * FROM sync_records WHERE shop_id=? AND entity_type!=? AND (updated_at>? OR (updated_at=? AND id>?)) ORDER BY updated_at,id LIMIT ?',
-      [shop, 'conflict', time, time, id, limit + 1],
+      'SELECT * FROM sync_records WHERE shop_id=? AND entity_type NOT IN (?,?,?) AND (updated_at>? OR (updated_at=? AND id>?)) ORDER BY updated_at,id LIMIT ?',
+      [
+        shop,
+        'conflict',
+        internalDeviceLimitEntityType,
+        internalDeviceRevocationEntityType,
+        time,
+        time,
+        id,
+        limit + 1,
+      ],
     );
     final page = rows.take(limit).toList();
     final changes = page
