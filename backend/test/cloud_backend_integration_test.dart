@@ -380,6 +380,37 @@ void main() {
         )).statusCode,
         200,
       );
+      final refreshedDeviceList = await http.get(
+        Uri.parse('http://127.0.0.1:8080/api/super-admin/shops'),
+        headers: {'Authorization': '******'},
+      );
+      expect(refreshedDeviceList.statusCode, 200);
+      final refreshedShops = (jsonDecode(
+        refreshedDeviceList.body,
+      ) as List<dynamic>).cast<Map<String, dynamic>>();
+      final refreshedShop = refreshedShops.singleWhere(
+        (shop) => shop['shopId'] == limitTwoShop,
+      );
+      expect(refreshedShop['deviceLimit'], 1);
+      expect(refreshedShop['registeredDeviceCount'], 1);
+      final refreshedDevices = await http.get(
+        Uri.parse(
+          'http://127.0.0.1:8080/api/super-admin/shops/$limitTwoShop/devices',
+        ),
+        headers: {'Authorization': '******'},
+      );
+      expect(refreshedDevices.statusCode, 200);
+      final refreshedDeviceBody =
+          jsonDecode(refreshedDevices.body) as Map<String, dynamic>;
+      expect(refreshedDeviceBody['registeredDeviceCount'], 1);
+      expect(
+        (refreshedDeviceBody['devices'] as List).where(
+          (device) =>
+              (device as Map)['deviceId'] == 'limit-two-a' &&
+              device['status'] == 'active',
+        ),
+        hasLength(1),
+      );
       final blockedDuringOverage = await _loginShop(
         shopId: limitTwoShop,
         username: 'limit-two-$stamp',
