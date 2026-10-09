@@ -1101,6 +1101,7 @@ class ServerApp {
           'isLifetime': isLifetime,
           'licenseAssigned': true,
           'deviceLimit': deviceLimit,
+          'registeredDeviceCount': 0,
         }),
       );
     } catch (error, stackTrace) {
@@ -1299,8 +1300,10 @@ class ServerApp {
     final rows = await db.select('SELECT * FROM shops WHERE shop_id = ?', [
       shopId,
     ]);
+    final state = DeviceStateStore(db);
     final response = _publicShop(rows.single)
-      ..['deviceLimit'] = await DeviceStateStore(db).deviceLimit(shopId);
+      ..['deviceLimit'] = await state.deviceLimit(shopId)
+      ..['registeredDeviceCount'] = await state.activeDeviceCount(shopId);
     return shelf.Response.ok(jsonEncode(response));
   }
 

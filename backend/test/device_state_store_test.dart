@@ -109,38 +109,66 @@ void main() {
     );
 
     test(
-      'grandfathers the shared legacy ID while enforcing modern device limits',
+      'activates a fresh generation without counting preserved devices',
       () async {
         final db = _MemoryDatabase();
         final store = DeviceStateStore(db);
-        await store.setDeviceLimit('shop-1', 1);
-        final legacy = await store.registerDevice(
-          shopId: 'shop-1',
-          userId: 'legacy-user',
-          deviceId: 'flutter-client',
-          deviceName: 'Legacy',
-          deviceType: 'legacy',
+        for (final id in ['flutter-client', 'old-device']) {
+          final oldRegistration = await store.registerDevice(
+            shopId: 'shop-1',
+            userId: 'legacy-user',
+            deviceId: id,
+            deviceName: 'Old device',
+            deviceType: 'legacy',
+          );
+          expect(oldRegistration.allowed, isTrue);
+        }
+        final preservedDevices = Map<String, Map<String, Object?>>.fromEntries(
+          db.devices.entries.map(
+            (entry) =>
+                MapEntry(entry.key, Map<String, Object?>.from(entry.value)),
+          ),
         );
-        expect(legacy.allowed, isTrue);
+        expect(await store.activeDeviceCount('shop-1'), 2);
+
+        await store.setDeviceLimit('shop-1', 1);
+
+        expect(await store.deviceLimit('shop-1'), 1);
+        expect(await store.activeDeviceCount('shop-1'), 0);
+        expect(db.devices, preservedDevices);
+        expect(db.devices, hasLength(2));
 
         final deviceA = await store.registerDevice(
           shopId: 'shop-1',
           userId: 'user-1',
           deviceId: 'device-a',
-          deviceName: 'A',
+          deviceName: 'Pixel',
           deviceType: 'android',
         );
         expect(deviceA.allowed, isTrue);
         expect(await store.activeDeviceCount('shop-1'), 1);
+        final savedDevice = db.devices['shop-1:device-a']!;
+        expect(savedDevice['device_name'], 'Pixel');
+        expect(savedDevice['device_type'], 'android');
+        expect(savedDevice['created_at'], isNotEmpty);
+        expect(savedDevice['last_seen_at'], isNotEmpty);
 
         final repeatedDeviceA = await store.registerDevice(
           shopId: 'shop-1',
           userId: 'user-1',
           deviceId: 'device-a',
-          deviceName: 'A',
+          deviceName: 'Pixel updated',
           deviceType: 'android',
         );
         expect(repeatedDeviceA.allowed, isTrue);
+        expect(await store.activeDeviceCount('shop-1'), 1);
+        expect(db.devices, hasLength(3));
+        expect(db.devices['shop-1:device-a']!['id'], savedDevice['id']);
+        expect(
+          db.devices['shop-1:device-a']!['created_at'],
+          savedDevice['created_at'],
+        );
+        expect(db.devices['shop-1:device-a']!['device_name'], 'Pixel updated');
 
         final deviceBAtLimit = await store.registerDevice(
           shopId: 'shop-1',
@@ -151,6 +179,7 @@ void main() {
         );
         expect(deviceBAtLimit.allowed, isFalse);
         expect(deviceBAtLimit.code, 'DEVICE_LIMIT_REACHED');
+        expect(db.devices.containsKey('shop-1:device-b'), isFalse);
 
         expect(await store.revokeDevice('shop-1', 'device-a'), isTrue);
         final revokedDeviceA = await store.registerDevice(
@@ -172,13 +201,88 @@ void main() {
         );
         expect(deviceBAfterRevocation.allowed, isTrue);
         expect(await store.activeDeviceCount('shop-1'), 1);
-        expect(
-          db.devices['shop-1:flutter-client']?['device_id'],
-          'flutter-client',
-        );
         expect(db.devices['shop-1:flutter-client']?['user_id'], 'legacy-user');
       },
     );
+
+    test('changing a limit starts a new generation', () async {
+      final db = _MemoryDatabase();
+      final store = DeviceStateStore(db);
+      await store.setDeviceLimit('shop-1', 1);
+      final deviceA = await store.registerDevice(
+        shopId: 'shop-1',
+        userId: 'user-1',
+        deviceId: 'device-a',
+        deviceName: 'A',
+        deviceType: 'android',
+      );
+      expect(deviceA.allowed, isTrue);
+      expect(await store.activeDeviceCount('shop-1'), 1);
+
+      final firstGeneration = (jsonDecode(
+        db.syncRecords.values.singleWhere(
+              (row) => row['entity_type'] == internalDeviceLimitEntityType,
+            )['data']
+            as String,
+      ) as Map)['generation'];
+      await store.setDeviceLimit('shop-1', 1);
+      final unchangedGeneration = (jsonDecode(
+        db.syncRecords.values.singleWhere(
+              (row) => row['entity_type'] == internalDeviceLimitEntityType,
+            )['data']
+            as String,
+      ) as Map)['generation'];
+      expect(unchangedGeneration, firstGeneration);
+      expect(await store.activeDeviceCount('shop-1'), 1);
+
+      await store.setDeviceLimit('shop-1', 3);
+      final changedGeneration = (jsonDecode(
+        db.syncRecords.values.singleWhere(
+              (row) => row['entity_type'] == internalDeviceLimitEntityType,
+            )['data']
+            as String,
+      ) as Map)['generation'];
+      expect(changedGeneration, isNot(firstGeneration));
+      expect(await store.activeDeviceCount('shop-1'), 0);
+    });
+
+    test('upgrades a pre-generation limit on successful login', () async {
+      final db = _MemoryDatabase();
+      final store = DeviceStateStore(db);
+      await store.registerDevice(
+        shopId: 'shop-1',
+        userId: 'old-user',
+        deviceId: 'old-device',
+        deviceName: 'Old',
+        deviceType: 'legacy',
+      );
+      await store.setDeviceLimit('shop-1', 1);
+      final limitRecord = db.syncRecords.values.singleWhere(
+        (row) => row['entity_type'] == internalDeviceLimitEntityType,
+      );
+      limitRecord['data'] = jsonEncode({'limit': 1});
+
+      expect(await store.activeDeviceCount('shop-1'), 0);
+      final login = await store.registerDevice(
+        shopId: 'shop-1',
+        userId: 'old-user',
+        deviceId: 'old-device',
+        deviceName: 'Updated',
+        deviceType: 'android',
+      );
+
+      expect(login.allowed, isTrue);
+      expect(await store.activeDeviceCount('shop-1'), 1);
+      expect(
+        (jsonDecode(
+          db.syncRecords.values.singleWhere(
+                (row) => row['entity_type'] == internalDeviceLimitEntityType,
+              )['data']
+              as String,
+        ) as Map)['generation'],
+        isA<String>(),
+      );
+    });
 
     test(
       'does not replace the existing device identity on repeated login',
@@ -237,6 +341,13 @@ void main() {
       entityType: internalDeviceRevocationEntityType,
       entityId: 'device-a',
       data: {'deviceId': 'device-a'},
+    );
+    db.syncRecords['device-registration-record'] = _syncRecord(
+      id: 'device-registration-record',
+      shopId: 'shop-1',
+      entityType: internalDeviceRegistrationEntityType,
+      entityId: 'device-a',
+      data: {'deviceId': 'device-a', 'generation': 'generation-1'},
     );
 
     final response = await SyncEngine(db).download('shop-1');
@@ -342,7 +453,7 @@ class _MemoryDatabase implements SyncDatabase {
           .toList();
     }
     if (normalized.startsWith('select * from sync_records where shop_id=?')) {
-      final entityTypes = parameters.skip(1).take(3).toSet();
+      final entityTypes = parameters.skip(1).take(4).toSet();
       final rows =
           syncRecords.values
               .where(

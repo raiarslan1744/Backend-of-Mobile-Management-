@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:test/test.dart';
 
 import '../bin/server.dart';
+import '../lib/sync_engine.dart';
 
 Future<String> _loginSuperAdminToken() async {
   final response = await http.post(
@@ -126,14 +127,17 @@ void main() {
       expect(unauthenticatedCreate.statusCode, 401);
 
       final limitOneShop = 'LIMIT-ONE-$stamp';
+      final createdLimitOneShop = await _createShop(
+        authToken: superAdminToken,
+        shopId: limitOneShop,
+        username: 'limit-one-$stamp',
+        deviceLimit: 1,
+      );
+      expect(createdLimitOneShop.statusCode, 200);
       expect(
-        (await _createShop(
-          authToken: superAdminToken,
-          shopId: limitOneShop,
-          username: 'limit-one-$stamp',
-          deviceLimit: 1,
-        )).statusCode,
-        200,
+        (jsonDecode(createdLimitOneShop.body)
+            as Map<String, dynamic>)['registeredDeviceCount'],
+        0,
       );
       final firstLogin = await _loginShop(
         shopId: limitOneShop,
@@ -144,6 +148,38 @@ void main() {
       final firstToken =
           (jsonDecode(firstLogin.body) as Map<String, dynamic>)['authToken']
               as String;
+      final deviceRows = await server.db.select(
+        'SELECT device_id, device_name, device_type, created_at, last_seen_at FROM devices WHERE shop_id = ? AND device_id = ?',
+        [limitOneShop, 'limit-one-device-a'],
+      );
+      expect(deviceRows, hasLength(1));
+      expect(deviceRows.single['device_name'], isNotEmpty);
+      expect(deviceRows.single['device_type'], isNotEmpty);
+      expect(deviceRows.single['created_at'], isNotEmpty);
+      expect(deviceRows.single['last_seen_at'], isNotEmpty);
+      expect(
+        await DeviceStateStore(server.db).activeDeviceCount(limitOneShop),
+        1,
+      );
+      final firstDeviceList = await http.get(
+        Uri.parse(
+          'http://127.0.0.1:8080/api/super-admin/shops/$limitOneShop/devices',
+        ),
+        headers: {'Authorization': 'Bearer $superAdminToken'},
+      );
+      expect(firstDeviceList.statusCode, 200);
+      final firstDeviceListBody =
+          jsonDecode(firstDeviceList.body) as Map<String, dynamic>;
+      expect(firstDeviceListBody['registeredDeviceCount'], 1);
+      final firstListedDevice =
+          (firstDeviceListBody['devices'] as List).single
+              as Map<String, dynamic>;
+      expect(firstListedDevice['deviceId'], 'limit-one-device-a');
+      expect(firstListedDevice['deviceName'], isNotEmpty);
+      expect(firstListedDevice['platform'], isNotEmpty);
+      expect(firstListedDevice['firstRegistered'], isNotEmpty);
+      expect(firstListedDevice['lastSeen'], isNotEmpty);
+      expect(firstListedDevice['status'], 'active');
       final logout = await http.post(
         Uri.parse('http://127.0.0.1:8080/api/auth/logout'),
         headers: {'Authorization': 'Bearer $firstToken'},
@@ -159,9 +195,8 @@ void main() {
       );
       expect(internalSyncDownload.statusCode, 200);
       expect(
-        (jsonDecode(internalSyncDownload.body) as Map<String, dynamic>)[
-          'changes'
-        ],
+        (jsonDecode(internalSyncDownload.body)
+            as Map<String, dynamic>)['changes'],
         isEmpty,
         reason: 'Device-limit state must not enter normal shop sync.',
       );
@@ -174,6 +209,13 @@ void main() {
       final repeatedToken =
           (jsonDecode(repeatedLogin.body) as Map<String, dynamic>)['authToken']
               as String;
+      expect(
+        await server.db.select(
+          'SELECT device_id FROM devices WHERE shop_id = ? AND device_id = ?',
+          [limitOneShop, 'limit-one-device-a'],
+        ),
+        hasLength(1),
+      );
       final secondDevice = await _loginShop(
         shopId: limitOneShop,
         username: 'limit-one-$stamp',
@@ -200,17 +242,13 @@ void main() {
       );
       expect(listedDevices.statusCode, 200, reason: listedDevices.body);
       expect(
-        (jsonDecode(listedDevices.body) as Map<String, dynamic>)[
-          'registeredDeviceCount'
-        ],
+        (jsonDecode(listedDevices.body)
+            as Map<String, dynamic>)['registeredDeviceCount'],
         1,
       );
       final revokeUrl =
           'http://127.0.0.1:8080/api/super-admin/shops/$limitOneShop/devices/limit-one-device-a';
-      expect(
-        (await http.delete(Uri.parse(revokeUrl))).statusCode,
-        401,
-      );
+      expect((await http.delete(Uri.parse(revokeUrl))).statusCode, 401);
       expect(
         (await http.delete(
           Uri.parse(revokeUrl),
@@ -258,16 +296,23 @@ void main() {
         )).statusCode,
         200,
       );
-      for (final deviceId in ['limit-two-a', 'limit-two-b']) {
-        expect(
-          (await _loginShop(
-            shopId: limitTwoShop,
-            username: 'limit-two-$stamp',
-            deviceId: deviceId,
-          )).statusCode,
-          200,
-        );
-      }
+      expect(
+        (await _loginShop(
+          shopId: limitTwoShop,
+          username: 'limit-two-$stamp',
+          deviceId: 'limit-two-a',
+        )).statusCode,
+        200,
+      );
+      final deviceBLogin = await _loginShop(
+        shopId: limitTwoShop,
+        username: 'limit-two-$stamp',
+        deviceId: 'limit-two-b',
+      );
+      expect(deviceBLogin.statusCode, 200);
+      final deviceBToken =
+          (jsonDecode(deviceBLogin.body) as Map<String, dynamic>)['authToken']
+              as String;
       expect(
         (await _loginShop(
           shopId: limitTwoShop,
@@ -287,9 +332,7 @@ void main() {
         'DEVICE_LIMIT_REACHED',
       );
       final decreaseLimit = await http.put(
-        Uri.parse(
-          'http://127.0.0.1:8080/api/super-admin/shops/$limitTwoShop',
-        ),
+        Uri.parse('http://127.0.0.1:8080/api/super-admin/shops/$limitTwoShop'),
         headers: {
           'Content-Type': 'application/json',
           'Authorization': 'Bearer $superAdminToken',
@@ -303,6 +346,17 @@ void main() {
         }),
       );
       expect(decreaseLimit.statusCode, 200, reason: decreaseLimit.body);
+      final updateBody = jsonDecode(decreaseLimit.body) as Map<String, dynamic>;
+      expect(updateBody['deviceLimit'], 1);
+      expect(updateBody['registeredDeviceCount'], 0);
+      expect(
+        await server.db.select(
+          'SELECT token FROM sessions WHERE token = ? AND device_id = ?',
+          [deviceBToken, 'limit-two-b'],
+        ),
+        hasLength(1),
+        reason: 'Changing a generation must not invalidate existing sessions.',
+      );
       final overLimit = await http.get(
         Uri.parse(
           'http://127.0.0.1:8080/api/super-admin/shops/$limitTwoShop/devices',
@@ -310,8 +364,8 @@ void main() {
         headers: {'Authorization': 'Bearer $superAdminToken'},
       );
       final overLimitBody = jsonDecode(overLimit.body) as Map<String, dynamic>;
-      expect(overLimitBody['registeredDeviceCount'], 2);
-      expect(overLimitBody['overDeviceLimit'], isTrue);
+      expect(overLimitBody['registeredDeviceCount'], 0);
+      expect(overLimitBody['overDeviceLimit'], isFalse);
       expect(
         (overLimitBody['devices'] as List).where(
           (device) => (device as Map)['status'] == 'active',
@@ -335,6 +389,29 @@ void main() {
       expect(
         (jsonDecode(blockedDuringOverage.body) as Map<String, dynamic>)['code'],
         'DEVICE_LIMIT_REACHED',
+      );
+      final revokeLimitTwoA = await http.delete(
+        Uri.parse(
+          'http://127.0.0.1:8080/api/super-admin/shops/$limitTwoShop/devices/limit-two-a',
+        ),
+        headers: {'Authorization': 'Bearer $superAdminToken'},
+      );
+      expect(revokeLimitTwoA.statusCode, 200, reason: revokeLimitTwoA.body);
+      expect(
+        await server.db.select(
+          'SELECT token FROM sessions WHERE token = ? AND device_id = ?',
+          [deviceBToken, 'limit-two-b'],
+        ),
+        hasLength(1),
+        reason: 'Revoking one device must not invalidate another device.',
+      );
+      expect(
+        (await http.get(
+          Uri.parse('http://127.0.0.1:8080/api/sync/protocol'),
+          headers: {'Authorization': 'Bearer $deviceBToken'},
+        )).statusCode,
+        200,
+        reason: 'Revoking one device must not invalidate another device.',
       );
 
       final nullLimitShop = 'LIMIT-NULL-$stamp';
@@ -376,9 +453,8 @@ void main() {
         );
         expect(nullLimitLogin.statusCode, 200);
         expect(
-          (jsonDecode(nullLimitLogin.body) as Map<String, dynamic>)[
-            'deviceLimit'
-          ],
+          (jsonDecode(nullLimitLogin.body)
+              as Map<String, dynamic>)['deviceLimit'],
           isNull,
         );
       }
@@ -423,9 +499,7 @@ void main() {
               as List<dynamic>;
       expect(legacyDevices, hasLength(2));
       expect(
-        legacyDevices.where(
-          (device) => (device as Map)['isLegacy'] == true,
-        ),
+        legacyDevices.where((device) => (device as Map)['isLegacy'] == true),
         hasLength(1),
       );
       final revokeLegacy = await http.delete(
@@ -463,256 +537,266 @@ void main() {
           deviceId: 'race-device-b',
         ),
       ]);
-      expect(raceResults.where((response) => response.statusCode == 200), hasLength(1));
-      final raceRejected =
-          raceResults.singleWhere((response) => response.statusCode == 403);
+      expect(
+        raceResults.where((response) => response.statusCode == 200),
+        hasLength(1),
+      );
+      final raceRejected = raceResults.singleWhere(
+        (response) => response.statusCode == 403,
+      );
       expect(
         (jsonDecode(raceRejected.body) as Map<String, dynamic>)['code'],
         'DEVICE_LIMIT_REACHED',
       );
     });
 
-    test('profile sync, shop username updates, and management authorization', () async {
-      final stamp = DateTime.now().microsecondsSinceEpoch;
-      final shopId = 'PROFILE-$stamp';
-      expect(
-        (await _createShop(
-          authToken: superAdminToken,
+    test(
+      'profile sync, shop username updates, and management authorization',
+      () async {
+        final stamp = DateTime.now().microsecondsSinceEpoch;
+        final shopId = 'PROFILE-$stamp';
+        expect(
+          (await _createShop(
+            authToken: superAdminToken,
+            shopId: shopId,
+            username: 'profile-admin-$stamp',
+            deviceLimit: 3,
+          )).statusCode,
+          200,
+        );
+        final adminLogin = await _loginShop(
           shopId: shopId,
           username: 'profile-admin-$stamp',
-          deviceLimit: 3,
-        )).statusCode,
-        200,
-      );
-      final adminLogin = await _loginShop(
-        shopId: shopId,
-        username: 'profile-admin-$stamp',
-        deviceId: 'profile-device-a',
-      );
-      final adminBody = jsonDecode(adminLogin.body) as Map<String, dynamic>;
-      final adminToken = adminBody['authToken'] as String;
-      final otherShopId = 'PROFILE-OTHER-$stamp';
-      expect(
-        (await _createShop(
-          authToken: superAdminToken,
-          shopId: otherShopId,
-          username: 'profile-other-$stamp',
-        )).statusCode,
-        200,
-      );
-      final adminShopCreate = await http.post(
-        Uri.parse('http://127.0.0.1:8080/api/shops'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $adminToken',
-        },
-        body: jsonEncode({
-          'shopId': 'ADMIN-CREATE-$stamp',
-          'licenseAssigned': true,
-          'isLifetime': true,
-          'ownerName': 'Not permitted',
-          'contact': '12345',
-          'address': 'Not permitted',
-          'username': 'admin-not-permitted-$stamp',
-          'password': 'admin-password-123',
-          'deviceLimit': 1,
-        }),
-      );
-      expect(adminShopCreate.statusCode, 403);
+          deviceId: 'profile-device-a',
+        );
+        final adminBody = jsonDecode(adminLogin.body) as Map<String, dynamic>;
+        final adminToken = adminBody['authToken'] as String;
+        final otherShopId = 'PROFILE-OTHER-$stamp';
+        expect(
+          (await _createShop(
+            authToken: superAdminToken,
+            shopId: otherShopId,
+            username: 'profile-other-$stamp',
+          )).statusCode,
+          200,
+        );
+        final adminShopCreate = await http.post(
+          Uri.parse('http://127.0.0.1:8080/api/shops'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $adminToken',
+          },
+          body: jsonEncode({
+            'shopId': 'ADMIN-CREATE-$stamp',
+            'licenseAssigned': true,
+            'isLifetime': true,
+            'ownerName': 'Not permitted',
+            'contact': '12345',
+            'address': 'Not permitted',
+            'username': 'admin-not-permitted-$stamp',
+            'password': 'admin-password-123',
+            'deviceLimit': 1,
+          }),
+        );
+        expect(adminShopCreate.statusCode, 403);
 
-      final updateProfile = await http.put(
-        Uri.parse('http://127.0.0.1:8080/api/shop/profile'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $adminToken',
-        },
-        body: jsonEncode({
-          'shopId': otherShopId,
-          'name': 'Cloud Current Name',
-          'address': 'Cloud Current Address',
-          'phone': '555-0101',
-        }),
-      );
-      expect(updateProfile.statusCode, 200, reason: updateProfile.body);
-      expect(
-        (jsonDecode(updateProfile.body) as Map<String, dynamic>)['shopId'],
-        shopId,
-      );
-      final otherProfile = await http.get(
-        Uri.parse('http://127.0.0.1:8080/api/super-admin/shops'),
-        headers: {'Authorization': 'Bearer $superAdminToken'},
-      );
-      final untouchedShop =
-          (jsonDecode(otherProfile.body) as List).cast<Map>().singleWhere(
-            (shop) => shop['shopId'] == otherShopId,
-          );
-      expect(untouchedShop['ownerName'], 'Integration Owner');
-      final secondDevice = await _loginShop(
-        shopId: shopId,
-        username: 'profile-admin-$stamp',
-        deviceId: 'profile-device-b',
-      );
-      final secondSession =
-          jsonDecode(secondDevice.body) as Map<String, dynamic>;
-      expect(secondSession['shopProfile']['name'], 'Cloud Current Name');
-      expect(secondSession['shopProfile']['address'], 'Cloud Current Address');
-      expect(secondSession['shopProfile']['phone'], '555-0101');
-
-      final employeeCreate = await http.post(
-        Uri.parse('http://127.0.0.1:8080/api/employees'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $adminToken',
-        },
-        body: jsonEncode({
-          'shopId': shopId,
-          'username': 'profile-employee-$stamp',
-          'password': 'employee-password',
-          'status': 'active',
-        }),
-      );
-      expect(employeeCreate.statusCode, 200, reason: employeeCreate.body);
-      final employeeCreateShop = await http.post(
-        Uri.parse('http://127.0.0.1:8080/api/shops'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $adminToken',
-        },
-        body: jsonEncode({
-          'shopId': 'EMPLOYEE-CREATE-$stamp',
-          'licenseAssigned': true,
-          'isLifetime': true,
-          'ownerName': 'Not permitted',
-          'contact': '12345',
-          'address': 'Not permitted',
-          'username': 'not-permitted-$stamp',
-          'password': 'admin-password-123',
-          'deviceLimit': 1,
-        }),
-      );
-      expect(employeeCreateShop.statusCode, 403);
-      final employeeLogin = await _loginShop(
-        shopId: shopId,
-        username: 'profile-employee-$stamp',
-        password: 'employee-password',
-        deviceId: 'profile-employee-device',
-      );
-      expect(employeeLogin.statusCode, 200, reason: employeeLogin.body);
-      final employeeToken =
-          (jsonDecode(employeeLogin.body) as Map<String, dynamic>)['authToken']
-              as String;
-      expect(
-        (await http.get(
-          Uri.parse('http://127.0.0.1:8080/api/shop/profile'),
-          headers: {'Authorization': 'Bearer $employeeToken'},
-        )).statusCode,
-        403,
-      );
-      expect(
-        (await http.put(
+        final updateProfile = await http.put(
           Uri.parse('http://127.0.0.1:8080/api/shop/profile'),
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer $employeeToken',
+            'Authorization': 'Bearer $adminToken',
           },
           body: jsonEncode({
-            'name': 'forbidden',
-            'address': 'forbidden',
-            'phone': 'forbidden',
+            'shopId': otherShopId,
+            'name': 'Cloud Current Name',
+            'address': 'Cloud Current Address',
+            'phone': '555-0101',
           }),
-        )).statusCode,
-        403,
-      );
-      expect(
-        (await http.get(
-          Uri.parse('http://127.0.0.1:8080/api/shop/profile'),
+        );
+        expect(updateProfile.statusCode, 200, reason: updateProfile.body);
+        expect(
+          (jsonDecode(updateProfile.body) as Map<String, dynamic>)['shopId'],
+          shopId,
+        );
+        final otherProfile = await http.get(
+          Uri.parse('http://127.0.0.1:8080/api/super-admin/shops'),
           headers: {'Authorization': 'Bearer $superAdminToken'},
-        )).statusCode,
-        403,
-      );
-      expect(
-        (await http.put(
-          Uri.parse('http://127.0.0.1:8080/api/shop/profile'),
+        );
+        final untouchedShop = (jsonDecode(otherProfile.body) as List)
+            .cast<Map>()
+            .singleWhere((shop) => shop['shopId'] == otherShopId);
+        expect(untouchedShop['ownerName'], 'Integration Owner');
+        final secondDevice = await _loginShop(
+          shopId: shopId,
+          username: 'profile-admin-$stamp',
+          deviceId: 'profile-device-b',
+        );
+        final secondSession =
+            jsonDecode(secondDevice.body) as Map<String, dynamic>;
+        expect(secondSession['shopProfile']['name'], 'Cloud Current Name');
+        expect(
+          secondSession['shopProfile']['address'],
+          'Cloud Current Address',
+        );
+        expect(secondSession['shopProfile']['phone'], '555-0101');
+
+        final employeeCreate = await http.post(
+          Uri.parse('http://127.0.0.1:8080/api/employees'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $adminToken',
+          },
+          body: jsonEncode({
+            'shopId': shopId,
+            'username': 'profile-employee-$stamp',
+            'password': 'employee-password',
+            'status': 'active',
+          }),
+        );
+        expect(employeeCreate.statusCode, 200, reason: employeeCreate.body);
+        final employeeCreateShop = await http.post(
+          Uri.parse('http://127.0.0.1:8080/api/shops'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $adminToken',
+          },
+          body: jsonEncode({
+            'shopId': 'EMPLOYEE-CREATE-$stamp',
+            'licenseAssigned': true,
+            'isLifetime': true,
+            'ownerName': 'Not permitted',
+            'contact': '12345',
+            'address': 'Not permitted',
+            'username': 'not-permitted-$stamp',
+            'password': 'admin-password-123',
+            'deviceLimit': 1,
+          }),
+        );
+        expect(employeeCreateShop.statusCode, 403);
+        final employeeLogin = await _loginShop(
+          shopId: shopId,
+          username: 'profile-employee-$stamp',
+          password: 'employee-password',
+          deviceId: 'profile-employee-device',
+        );
+        expect(employeeLogin.statusCode, 200, reason: employeeLogin.body);
+        final employeeToken =
+            (jsonDecode(employeeLogin.body)
+                    as Map<String, dynamic>)['authToken']
+                as String;
+        expect(
+          (await http.get(
+            Uri.parse('http://127.0.0.1:8080/api/shop/profile'),
+            headers: {'Authorization': 'Bearer $employeeToken'},
+          )).statusCode,
+          403,
+        );
+        expect(
+          (await http.put(
+            Uri.parse('http://127.0.0.1:8080/api/shop/profile'),
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $employeeToken',
+            },
+            body: jsonEncode({
+              'name': 'forbidden',
+              'address': 'forbidden',
+              'phone': 'forbidden',
+            }),
+          )).statusCode,
+          403,
+        );
+        expect(
+          (await http.get(
+            Uri.parse('http://127.0.0.1:8080/api/shop/profile'),
+            headers: {'Authorization': 'Bearer $superAdminToken'},
+          )).statusCode,
+          403,
+        );
+        expect(
+          (await http.put(
+            Uri.parse('http://127.0.0.1:8080/api/shop/profile'),
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $superAdminToken',
+            },
+            body: jsonEncode({
+              'name': 'forbidden',
+              'address': 'forbidden',
+              'phone': 'forbidden',
+            }),
+          )).statusCode,
+          403,
+        );
+
+        final collision = await http.post(
+          Uri.parse('http://127.0.0.1:8080/api/employees'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $adminToken',
+          },
+          body: jsonEncode({
+            'shopId': shopId,
+            'username': 'duplicate-$stamp',
+            'password': 'employee-password',
+            'status': 'active',
+          }),
+        );
+        expect(collision.statusCode, 200, reason: collision.body);
+        final duplicateUpdate = await http.put(
+          Uri.parse('http://127.0.0.1:8080/api/super-admin/shops/$shopId'),
           headers: {
             'Content-Type': 'application/json',
             'Authorization': 'Bearer $superAdminToken',
           },
           body: jsonEncode({
-            'name': 'forbidden',
-            'address': 'forbidden',
-            'phone': 'forbidden',
+            'ownerName': 'New owner',
+            'contact': '555-0102',
+            'address': 'New address',
+            'username': 'duplicate-$stamp',
           }),
-        )).statusCode,
-        403,
-      );
+        );
+        expect(duplicateUpdate.statusCode, 409);
 
-      final collision = await http.post(
-        Uri.parse('http://127.0.0.1:8080/api/employees'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $adminToken',
-        },
-        body: jsonEncode({
-          'shopId': shopId,
-          'username': 'duplicate-$stamp',
-          'password': 'employee-password',
-          'status': 'active',
-        }),
-      );
-      expect(collision.statusCode, 200, reason: collision.body);
-      final duplicateUpdate = await http.put(
-        Uri.parse('http://127.0.0.1:8080/api/super-admin/shops/$shopId'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $superAdminToken',
-        },
-        body: jsonEncode({
-          'ownerName': 'New owner',
-          'contact': '555-0102',
-          'address': 'New address',
-          'username': 'duplicate-$stamp',
-        }),
-      );
-      expect(duplicateUpdate.statusCode, 409);
-
-      final usernameUpdate = await http.put(
-        Uri.parse('http://127.0.0.1:8080/api/super-admin/shops/$shopId'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $superAdminToken',
-        },
-        body: jsonEncode({
-          'ownerName': 'New owner',
-          'contact': '555-0103',
-          'address': 'New address',
-          'username': 'renamed-admin-$stamp',
-        }),
-      );
-      expect(usernameUpdate.statusCode, 200, reason: usernameUpdate.body);
-      expect(
-        (await _loginShop(
-          shopId: shopId,
-          username: 'profile-admin-$stamp',
-        )).statusCode,
-        401,
-      );
-      expect(
-        (await _loginShop(
-          shopId: shopId,
-          username: 'renamed-admin-$stamp',
-        )).statusCode,
-        200,
-      );
-      final shops = await http.get(
-        Uri.parse('http://127.0.0.1:8080/api/super-admin/shops'),
-        headers: {'Authorization': 'Bearer $superAdminToken'},
-      );
-      final updatedShop = (jsonDecode(shops.body) as List).cast<Map>().singleWhere(
-        (shop) => shop['shopId'] == shopId,
-      );
-      expect(updatedShop['username'], 'renamed-admin-$stamp');
-      expect(updatedShop['contact'], '555-0103');
-    });
+        final usernameUpdate = await http.put(
+          Uri.parse('http://127.0.0.1:8080/api/super-admin/shops/$shopId'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $superAdminToken',
+          },
+          body: jsonEncode({
+            'ownerName': 'New owner',
+            'contact': '555-0103',
+            'address': 'New address',
+            'username': 'renamed-admin-$stamp',
+          }),
+        );
+        expect(usernameUpdate.statusCode, 200, reason: usernameUpdate.body);
+        expect(
+          (await _loginShop(
+            shopId: shopId,
+            username: 'profile-admin-$stamp',
+          )).statusCode,
+          401,
+        );
+        expect(
+          (await _loginShop(
+            shopId: shopId,
+            username: 'renamed-admin-$stamp',
+          )).statusCode,
+          200,
+        );
+        final shops = await http.get(
+          Uri.parse('http://127.0.0.1:8080/api/super-admin/shops'),
+          headers: {'Authorization': 'Bearer $superAdminToken'},
+        );
+        final updatedShop = (jsonDecode(shops.body) as List)
+            .cast<Map>()
+            .singleWhere((shop) => shop['shopId'] == shopId);
+        expect(updatedShop['username'], 'renamed-admin-$stamp');
+        expect(updatedShop['contact'], '555-0103');
+      },
+    );
 
     test('shop admin can log in and sync data to a second device', () async {
       final shopId = 'SHOP-${DateTime.now().microsecondsSinceEpoch}';
