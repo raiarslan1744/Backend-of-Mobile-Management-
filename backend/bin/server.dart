@@ -131,7 +131,7 @@ class DatabaseAdapter implements SyncDatabase {
             throw ArgumentError.value(lockScope, 'lockScope');
           }
           await transaction.execute(
-            'SELECT pg_advisory_xact_lock(825017431, hashtext(?))',
+            'SELECT pg_advisory_xact_lock(825017431, hashtext(\$1))',
             parameters: [lockScope],
           );
         }
