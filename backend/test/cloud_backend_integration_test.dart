@@ -97,6 +97,31 @@ void main() {
   });
 
   group('cloud backend', () {
+    test(
+      'shop login acquires its scoped PostgreSQL transaction lock',
+      () async {
+        final stamp = DateTime.now().microsecondsSinceEpoch;
+        final shopId = 'LOGIN-LOCK-$stamp';
+        final username = 'login-lock-admin-$stamp';
+        expect(
+          (await _createShop(
+            authToken: superAdminToken,
+            shopId: shopId,
+            username: username,
+          )).statusCode,
+          200,
+        );
+
+        final response = await _loginShop(
+          shopId: shopId,
+          username: username,
+          deviceId: 'login-lock-device',
+        );
+
+        expect(response.statusCode, 200, reason: response.body);
+      },
+    );
+
     test('shop-scoped transactions do not block unrelated shops', () async {
       final entered = Completer<void>();
       final release = Completer<void>();
