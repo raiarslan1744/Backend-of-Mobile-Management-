@@ -17,6 +17,16 @@ String hashPassword(String password) {
 
 String utcNow() => DateTime.now().toUtc().toIso8601String();
 
+String? canonicalShopPhone(String value) {
+  final phone = value.trim();
+  final digits = phone.replaceAll(RegExp(r'\D'), '');
+  if (digits.length < 7 || digits.length > 15 ||
+      !RegExp(r'^[0-9+().\-\s]+$').hasMatch(phone)) {
+    return null;
+  }
+  return phone;
+}
+
 class SuperAdminCredentials {
   const SuperAdminCredentials({required this.username, required this.password});
 
@@ -733,6 +743,8 @@ class ServerApp {
     router.put('/api/super-admin/shops/<shopId>', _updateShop);
     router.post('/api/super-admin/shops/<shopId>/license', _renewShopLicense);
     router.delete('/api/super-admin/shops/<shopId>', _deleteShop);
+    router.get('/api/shops/<shopId>/settings', _getShopSettings);
+    router.put('/api/shops/<shopId>/settings', _updateShopSettings);
     router.post('/api/shops', _createShop);
     router.post('/api/auth/login', _login);
     router.post('/api/auth/logout', _logout);
@@ -1336,29 +1348,19 @@ class ServerApp {
       );
     }
     final body = await _body(request, rejectMalformed: true);
-    final name = body['name'];
-    final address = body['address'];
-    final phone = body['phone'];
-    if (name is! String ||
-        name.trim().isEmpty ||
-        address is! String ||
-        address.trim().isEmpty ||
-        phone is! String ||
-        phone.trim().isEmpty ||
-        name.length > 200 ||
-        address.length > 500 ||
-        phone.length > 64) {
-      return shelf.Response(
-        400,
-        body: jsonEncode({'error': 'Shop profile fields are invalid.'}),
-      );
+    if (body.containsKey('name') || body.containsKey('ownerName') || body.containsKey('address')) {
+      return shelf.Response(403, body: jsonEncode({
+        'error': 'Only a Super Admin can change the shop name or address.',
+        'code': 'SHOP_IDENTITY_SUPER_ADMIN_ONLY',
+      }));
+    }
+    final phone = canonicalShopPhone(body['phone']?.toString() ?? '');
+    if (phone == null) {
+      return shelf.Response(400, body: jsonEncode({'error': 'Enter a valid shop phone number.'}));
     }
     final shopId = auth['user']['shop_id'] as String;
     await db.syncTransaction(() async {
-      await db.execute(
-        'UPDATE shops SET owner_name = ?, address = ?, contact = ?, updated_at = ? WHERE shop_id = ?',
-        [name.trim(), address.trim(), phone.trim(), utcNow(), shopId],
-      );
+      await db.execute('UPDATE shops SET contact = ?, updated_at = ? WHERE shop_id = ?', [phone, utcNow(), shopId]);
     }, lockScope: shopId);
     final rows = await db.select(
       'SELECT shop_id, owner_name, address, contact, updated_at FROM shops WHERE shop_id = ?',
@@ -1376,6 +1378,156 @@ class ServerApp {
   Map<String, Object?> _shopProfile(Map<String, Object?> row) => {
     'shopId': row['shop_id'],
     'name': row['owner_name'],
+    'address': row['address'],
+    'phone': row['contact'],
+    'updatedAt': row['updated_at'],
+  };
+
+  Future<shelf.Response> _getShopSettings(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null) {
+      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
+    }
+    final shopId = request.params['shopId']?.trim() ?? '';
+    final user = auth['user'] as Map;
+    if (user['role'] != 'super_admin' &&
+        (!{'admin', 'employee'}.contains(user['role']) || user['shop_id'] != shopId)) {
+      return shelf.Response(
+        403,
+        body: jsonEncode({
+          'error': 'You are not authorized to view this shop.',
+          'code': 'SHOP_ACCESS_DENIED',
+        }),
+      );
+    }
+    final rows = await db.select(
+      'SELECT shop_id, owner_name, address, contact, updated_at FROM shops WHERE shop_id = ?',
+      [shopId],
+    );
+    if (rows.isEmpty) {
+      return shelf.Response(
+        404,
+        body: jsonEncode({'error': 'Shop not found', 'code': 'SHOP_NOT_FOUND'}),
+      );
+    }
+    return shelf.Response.ok(jsonEncode(_shopSettingsPayload(rows.first)));
+  }
+
+  Future<shelf.Response> _updateShopSettings(shelf.Request request) async {
+    final auth = await _requireAuth(request);
+    if (auth == null) {
+      return shelf.Response(401, body: jsonEncode({'error': 'Unauthorized'}));
+    }
+    final shopId = request.params['shopId']?.trim() ?? '';
+    final user = auth['user'] as Map;
+    final isSuperAdmin = user['role'] == 'super_admin';
+    if (!isSuperAdmin &&
+        (user['role'] != 'admin' || user['shop_id'] != shopId)) {
+      return shelf.Response(
+        403,
+        body: jsonEncode({
+          'error': 'You are not authorized to update this shop.',
+          'code': 'SHOP_ACCESS_DENIED',
+        }),
+      );
+    }
+
+    if (isSuperAdmin) {
+      final response = await _updateShop(request);
+      if (response.statusCode != 200) return response;
+      final rows = await db.select(
+        'SELECT shop_id, owner_name, address, contact, updated_at FROM shops WHERE shop_id = ?', [shopId]);
+      return shelf.Response.ok(jsonEncode(_shopSettingsPayload(rows.single)));
+    }
+
+    final body = await _body(request);
+    if (!isSuperAdmin &&
+        (body.containsKey('ownerName') ||
+            body.containsKey('name') ||
+            body.containsKey('address'))) {
+      return shelf.Response(
+        403,
+        body: jsonEncode({
+          'error': 'Only a Super Admin can change the shop name or address.',
+          'code': 'SHOP_IDENTITY_SUPER_ADMIN_ONLY',
+        }),
+      );
+    }
+
+    final requestedPhone = body['phone'] ?? body['contact'];
+    final currentRows = await db.select(
+      'SELECT shop_id, owner_name, address, contact, username, password_hash, updated_at FROM shops WHERE shop_id = ?',
+      [shopId],
+    );
+    if (currentRows.isEmpty) {
+      return shelf.Response(
+        404,
+        body: jsonEncode({'error': 'Shop not found', 'code': 'SHOP_NOT_FOUND'}),
+      );
+    }
+    final current = currentRows.first;
+    final currentPhone = current['contact']?.toString() ?? '';
+    if (!isSuperAdmin && requestedPhone == null) {
+      return shelf.Response(
+        400,
+        body: jsonEncode({
+          'error': 'Enter a valid shop phone number.',
+          'code': 'INVALID_SHOP_PHONE',
+        }),
+      );
+    }
+    final phoneInput = requestedPhone?.toString().trim() ?? currentPhone.trim();
+    final parsedPhone = canonicalShopPhone(phoneInput);
+    if (parsedPhone == null &&
+        !(isSuperAdmin && phoneInput == currentPhone.trim())) {
+      return shelf.Response(
+        400,
+        body: jsonEncode({
+          'error': 'Enter a valid shop phone number.',
+          'code': 'INVALID_SHOP_PHONE',
+        }),
+      );
+    }
+    final phone = parsedPhone ?? currentPhone;
+    {
+      final expectedUpdatedAt = body['updatedAt']?.toString();
+      if (expectedUpdatedAt == null ||
+          expectedUpdatedAt != current['updated_at']?.toString()) {
+        return shelf.Response(
+          409,
+          body: jsonEncode({
+            'error': 'Shop settings changed on another device. Refresh and retry.',
+            'code': 'SHOP_SETTINGS_STALE',
+            'settings': _shopSettingsPayload(current),
+          }),
+        );
+      }
+      final saved = await db.select(
+        'UPDATE shops SET contact = ?, updated_at = ? WHERE shop_id = ? AND updated_at = ? RETURNING shop_id, owner_name, address, contact, updated_at',
+        [phone, utcNow(), shopId, expectedUpdatedAt],
+      );
+      if (saved.isEmpty) {
+        final latest = await db.select(
+          'SELECT shop_id, owner_name, address, contact, updated_at FROM shops WHERE shop_id = ?',
+          [shopId],
+        );
+        return shelf.Response(
+          409,
+          body: jsonEncode({
+            'error': 'Shop settings changed on another device. Refresh and retry.',
+            'code': 'SHOP_SETTINGS_STALE',
+            if (latest.isNotEmpty) 'settings': _shopSettingsPayload(latest.first),
+          }),
+        );
+      }
+      return shelf.Response.ok(jsonEncode(_shopSettingsPayload(saved.first)));
+    }
+
+  }
+
+  Map<String, dynamic> _shopSettingsPayload(Map<String, Object?> row) => {
+    'shopId': row['shop_id'],
+    'ownerName': row['owner_name'],
     'address': row['address'],
     'phone': row['contact'],
     'updatedAt': row['updated_at'],
@@ -1643,6 +1795,7 @@ class ServerApp {
           shopInfo['license_expiry_date'] != null ||
           sessionPayload['isLifetime'] == true;
       sessionPayload['shopProfile'] = _shopProfile(shopInfo);
+      sessionPayload['shopDetails'] = _shopSettingsPayload(shopInfo);
     }
 
     return shelf.Response.ok(jsonEncode(sessionPayload));
