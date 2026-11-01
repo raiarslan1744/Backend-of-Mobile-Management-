@@ -705,6 +705,15 @@ void main() {
       );
       expect(deleteResponse.statusCode, 200, reason: deleteResponse.body);
 
+      // A different pool must observe the commit, not an uncommitted row
+      // visible only to whichever pooled connection handled the request.
+      final observer = await DatabaseAdapter.open();
+      try {
+        expect(await observer.select('SELECT shop_id FROM shops WHERE shop_id = ?', [originalShopId]), isEmpty);
+      } finally {
+        await observer.dispose();
+      }
+
       final listResponse = await http.get(
         Uri.parse('http://127.0.0.1:8080/api/super-admin/shops'),
         headers: {'Authorization': 'Bearer $superToken'},

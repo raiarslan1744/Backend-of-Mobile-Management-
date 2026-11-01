@@ -872,8 +872,8 @@ class ServerApp {
       print(
         'DELETE STARTING TRANSACTION shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}',
       );
-      await db.execute('BEGIN');
       try {
+        await db.syncTransaction(() async {
         await db.execute("SET LOCAL lock_timeout = '5s'");
         await db.execute("SET LOCAL statement_timeout = '12s'");
 
@@ -986,12 +986,11 @@ class ServerApp {
         print(
           'DELETE BATCH COMPLETE shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}',
         );
-        await db.execute('COMMIT');
+        }, lockScope: shopId);
         print(
           'COMMIT COMPLETE shopId=$shopId elapsedMs=${DateTime.now().difference(deleteStartedAt).inMilliseconds}',
         );
       } catch (error, stackTrace) {
-        await db.execute('ROLLBACK');
         print(
           'DATABASE CLEANUP FAILED shopId=$shopId type=${error.runtimeType} message=$error stackTrace=$stackTrace',
         );
